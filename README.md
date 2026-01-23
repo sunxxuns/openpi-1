@@ -16,7 +16,39 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 - [Sept 2025] We released PyTorch support in openpi.
 - [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
 - [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID.
+
+## Benchmark Results: NVIDIA H200 vs AMD MI350
+
+Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels (Aiter Flash Attention + Triton).
+
+### Pi0 Full Policy Inference (3.5B model, batch=1)
+
+| Metric | AMD MI350 (Aiter) | NVIDIA H200 (SDPA) |
+|--------|-------------------|---------------------|
+| Mean Latency | 142.0 ms | **118.5 ms** |
+| Throughput | 7.04 Hz | **8.44 Hz** |
+| Memory | 7.10 GB | 7.06 GB |
+
+**Result:** H200 is ~15-17% faster on inference
+
+### 8-GPU DDP Training (3.3B Model)
+
+| Batch/GPU | Total Batch | Seq | AMD MI350 (Aiter) | NVIDIA H200 (SDPA) |
+|-----------|-------------|-----|-------------------|---------------------|
+| 4 | 32 | 512 | 225 samples/s | 218 samples/s |
+| 8 | 64 | 512 | 329 samples/s | 279 samples/s |
+| 8 | 64 | 1024 | 196 samples/s | 157 samples/s |
+| 16 | 128 | 512 | **407 samples/s** | 320 samples/s |
+
+**Result:** MI350 is ~21-27% faster on training with Aiter+Triton optimizations
+
+### Analysis
+
+- **Inference:** H200 benefits from Hopper tensor cores (`nvjet_sm90_*` kernels) and HBM3e bandwidth
+- **Training:** MI350's Aiter Flash Attention + Triton kernels are optimized for backward pass operations
+
+For detailed results, trace files, and benchmark scripts, see [BENCHMARK_H200.md](BENCHMARK_H200.md). 
 
 
 ## Requirements
