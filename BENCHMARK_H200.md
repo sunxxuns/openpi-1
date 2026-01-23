@@ -12,17 +12,19 @@ Comparison benchmark results for NVIDIA H200 vs AMD MI350 (PR #858).
 
 ## Pi0 Full Policy Inference (3.5B model, batch=1)
 
-| Metric | AMD MI350 (Aiter) | NVIDIA H200 (eager) | NVIDIA H200 (FA2) |
-|--------|-------------------|---------------------|-------------------|
-| Mean Latency | 142.0 ms | 120.8 ms | 118.5 ms |
-| Throughput | 7.04 Hz | **8.28 Hz** | **8.44 Hz** |
-| Memory | 7.10 GB | 7.06 GB | 7.06 GB |
-| Denoising Steps | 10 | 10 | 10 |
-| Actions Shape | (1, 10, 32) | (1, 10, 32) | (1, 10, 32) |
+| Configuration | Latency | Throughput | Memory | Speedup vs MI350 |
+|---------------|---------|------------|--------|------------------|
+| AMD MI350 (Aiter) | 142.0 ms | 7.04 Hz | 7.10 GB | 1.0x |
+| NVIDIA H200 (eager) | 120.8 ms | 8.28 Hz | 7.06 GB | 1.18x |
+| NVIDIA H200 (FA2) | 118.5 ms | 8.44 Hz | 7.06 GB | 1.20x |
+| **NVIDIA H200 (torch.compile)** | **32.9 ms** | **30.44 Hz** | 7.03 GB | **4.32x** |
 
 **Pipeline:** SigLIP image encoding → Gemma text encoding → Prefill (KV cache) → 10 denoising steps
 
-**Result:** H200 is ~15-17% faster on inference
+**Key Finding:** `torch.compile(mode='max-autotune')` provides a **3.7x speedup** over eager mode by:
+- Fusing operations into optimized Triton kernels
+- Eliminating kernel launch overhead
+- Auto-tuning kernel configurations for H200
 
 ## 8-GPU DDP Training (3.3B Model)
 
@@ -57,9 +59,12 @@ Available in `traces/` directory for analysis with [Perfetto](https://ui.perfett
 
 | Trace | File | Size |
 |-------|------|------|
-| H200 Inference | `h200_inference.json` | 280.6 MB |
+| H200 Inference (eager) | `h200_inference.json` | 280.6 MB |
+| **H200 Inference (torch.compile)** | `h200_inference_compiled.json` | **20.8 MB** |
 | H200 DDP SDPA (rank 0-7) | `h200_ddp_sdpa_rank[0-7].json` | ~41 MB each |
 | H200 DDP eager (rank 0-7) | `h200_ddp_training_rank[0-7].json` | ~46 MB each |
+
+Note: The compiled trace is much smaller (20.8 MB vs 280.6 MB) due to fused kernels reducing the number of operations.
 
 ## Running Benchmarks
 
@@ -98,8 +103,18 @@ torchrun --nproc_per_node=8 scripts/benchmark_h200_ddp_sdpa.py
 | `nvjet_sm90_tst_128x272_64x4_2x1_v_bz_coopA_TNT` | 13.2 ms | 180 |
 | `nvjet_sm90_tst_48x64_64x15_4x2_h_bz_bias_TNN` | 13.1 ms | 2025 |
 
+## Top Fused Kernels (torch.compile)
+
+| Kernel | CUDA Time | Calls | Description |
+|--------|-----------|-------|-------------|
+| `triton_tem_fused_mm_t_view_14` | 10.5 ms | 1800 | Fused matmul + transpose + view |
+| `triton_tem_fused_addmm_t_view_3` | 10.4 ms | 1215 | Fused addmm + transpose + view |
+| `triton_tem_fused__unsafe_view_gelu_mm_mul_t_view_28` | 9.9 ms | 900 | Fused GELU + matmul + mul |
+| `triton_tem_fused_bmm_clone_mm_t_transpose_view_24` | 6.8 ms | 900 | Fused bmm + clone + matmul |
+
 ## Conclusion
 
-- **For inference workloads:** NVIDIA H200 provides better performance (~15-17% faster)
-- **For training workloads:** AMD MI350 with Aiter+Triton optimizations provides better performance (~21-27% faster)
-- The performance difference in training suggests AMD's custom kernel optimizations in PR #858 are particularly effective for backward pass operations
+- **For inference with torch.compile:** NVIDIA H200 is **4.3x faster** than MI350 (32.9ms vs 142.0ms)
+- **For inference (eager mode):** NVIDIA H200 is ~15-17% faster than MI350
+- **For training workloads:** AMD MI350 with Aiter+Triton optimizations is ~21-27% faster
+- **Key insight:** torch.compile eliminates most kernel launch overhead by fusing operations, making it essential for production inference on NVIDIA GPUs

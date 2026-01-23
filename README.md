@@ -20,17 +20,17 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Benchmark Results: NVIDIA H200 vs AMD MI350
 
-Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels (Aiter Flash Attention + Triton).
+Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels.
 
 ### Pi0 Full Policy Inference (3.5B model, batch=1)
 
-| Metric | AMD MI350 (Aiter) | NVIDIA H200 (SDPA) |
-|--------|-------------------|---------------------|
-| Mean Latency | 142.0 ms | **118.5 ms** |
-| Throughput | 7.04 Hz | **8.44 Hz** |
-| Memory | 7.10 GB | 7.06 GB |
+| Configuration | Latency | Throughput | Memory |
+|---------------|---------|------------|--------|
+| AMD MI350 (Aiter) | 142.0 ms | 7.04 Hz | 7.10 GB |
+| NVIDIA H200 (eager) | 120.8 ms | 8.28 Hz | 7.06 GB |
+| **NVIDIA H200 (torch.compile)** | **32.9 ms** | **30.44 Hz** | 7.03 GB |
 
-**Result:** H200 is ~15-17% faster on inference
+**Result:** H200 with torch.compile is **4.3x faster** than MI350, **3.7x faster** than eager mode
 
 ### 8-GPU DDP Training (3.3B Model)
 
@@ -45,7 +45,8 @@ Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels (A
 
 ### Analysis
 
-- **Inference:** H200 benefits from Hopper tensor cores (`nvjet_sm90_*` kernels) and HBM3e bandwidth
+- **Inference with torch.compile:** Fuses operations into optimized Triton kernels, reducing launch overhead by 3.7x
+- **Inference (eager):** H200 benefits from Hopper tensor cores (`nvjet_sm90_*` kernels) and HBM3e bandwidth
 - **Training:** MI350's Aiter Flash Attention + Triton kernels are optimized for backward pass operations
 
 For detailed results, trace files, and benchmark scripts, see [BENCHMARK_H200.md](BENCHMARK_H200.md). 
