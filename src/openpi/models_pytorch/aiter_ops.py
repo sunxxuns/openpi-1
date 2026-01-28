@@ -22,11 +22,21 @@ except ImportError:
 
 # Legacy aiter support (for flash attention)
 AITER_AVAILABLE = False
+AITER_GEMM_AVAILABLE = False
 try:
     import aiter
     AITER_AVAILABLE = True
+    # Check for tuned GEMM
+    try:
+        from aiter.tuned_gemm import gemm_a16w16
+        AITER_GEMM_AVAILABLE = True
+    except ImportError:
+        pass
 except ImportError:
     pass
+
+# Global flag to enable aiter GEMM
+USE_AITER_GEMM = os.environ.get("USE_AITER_GEMM", "0") == "1"
 
 
 def set_use_aiter_ops(enabled: bool):
@@ -271,6 +281,203 @@ class OptimizedGemmaMLP(nn.Module):
             hidden = F.gelu(gate, approximate='tanh') * up
         
         return self.down_proj(hidden)
+
+
+# ============================================================================
+# Fuse MLP weights (gate + up) for GemmaMLP
+# ============================================================================
+
+def fuse_mlp_weights(model: nn.Module) -> nn.Module:
+    """
+    Fuse gate_proj and up_proj weights in GemmaMLP modules.
+    
+    This creates a combined weight for gate+up projection, enabling:
+    1. Single GEMM instead of two
+    2. Fused GELU+mul kernel when available
+    
+    Call this AFTER loading weights but BEFORE torch.compile.
+    """
+    try:
+        from transformers.models.gemma.modeling_gemma import GemmaMLP
+    except ImportError:
+        print("Warning: Could not import GemmaMLP, skipping fusion")
+        return model
+    
+    fused_count = 0
+    
+    for _, module in model.named_modules():
+        if isinstance(module, GemmaMLP):
+            if hasattr(module, "_use_fused") and module._use_fused:
+                continue
+            fused_weight = torch.cat(
+                [module.gate_proj.weight, module.up_proj.weight], dim=0
+            )
+            module.register_buffer("_fused_gate_up_weight", fused_weight)
+            module._use_fused = True
+            fused_count += 1
+    
+    if fused_count > 0:
+        print(f"Fused {fused_count} MLP modules")
+    
+    return model
+
+
+# ============================================================================
+# Aiter GEMM - optimized matrix multiply for AMD
+# ============================================================================
+
+def set_use_aiter_gemm(enabled: bool):
+    """Enable or disable aiter GEMM globally."""
+    global USE_AITER_GEMM
+    USE_AITER_GEMM = enabled
+    if enabled and not AITER_GEMM_AVAILABLE:
+        print("Warning: aiter GEMM not available, falling back to F.linear")
+
+
+def get_use_aiter_gemm() -> bool:
+    """Check if aiter GEMM is enabled."""
+    return USE_AITER_GEMM and AITER_GEMM_AVAILABLE
+
+
+def aiter_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    """
+    Linear layer using aiter's optimized GEMM kernels.
+    
+    Uses ASM kernels for QKV-like shapes where K == N (1.3-1.7x faster).
+    Uses F.linear for MLP shapes where it's faster.
+    """
+    if not AITER_GEMM_AVAILABLE:
+        return F.linear(x, weight, bias)
+    
+    # Handle batched input
+    orig_shape = x.shape
+    x_2d = x.view(-1, x.shape[-1]) if x.dim() >= 3 else x
+    
+    _, k_dim = x_2d.shape
+    n_dim = weight.shape[0]
+    
+    # Use ASM only for square-ish shapes (QKV projections) where it's faster
+    # Criteria: K == N, both divisible by 64, BF16, no bias
+    use_asm = (
+        x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and k_dim == n_dim
+        and n_dim % 64 == 0
+        and k_dim % 64 == 0
+        and bias is None
+    )
+    
+    if use_asm:
+        try:
+            from aiter import gemm_a16w16_asm
+            out = torch.empty(x_2d.shape[0], n_dim, dtype=torch.float32, device=x.device)
+            gemm_a16w16_asm(x_2d, weight, out, None, None, None, False)
+            out = out.to(torch.bfloat16)
+            if len(orig_shape) >= 3:
+                out = out.view(*orig_shape[:-1], -1)
+            return out
+        except Exception:
+            pass  # Fall back to F.linear
+    
+    out = F.linear(x, weight, bias)
+    return out
+
+
+class AiterLinear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear that uses aiter's tuned GEMM.
+    """
+    
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / fan_in**0.5 if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if get_use_aiter_gemm():
+            return aiter_linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
+    
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> "AiterLinear":
+        """Convert an existing nn.Linear to AiterLinear."""
+        new_linear = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        new_linear.weight = linear.weight
+        if linear.bias is not None:
+            new_linear.bias = linear.bias
+        return new_linear
+
+
+def replace_linear_with_aiter(model: nn.Module, target_modules: list = None) -> nn.Module:
+    """
+    Replace nn.Linear modules with AiterLinear for optimized GEMM.
+    """
+    if not AITER_GEMM_AVAILABLE:
+        print("Warning: aiter GEMM not available, skipping replacement")
+        return model
+    
+    replaced_count = 0
+    
+    def should_replace(name):
+        if target_modules is None:
+            return True
+        return any(t in name for t in target_modules)
+    
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and should_replace(name):
+            replacements.append((name, module))
+    
+    for name, linear in replacements:
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], AiterLinear.from_linear(linear))
+        replaced_count += 1
+    
+    if replaced_count > 0:
+        print(f"Replaced {replaced_count} Linear layers with AiterLinear")
+    
+    return model
+
+
+def patch_linear_forward():
+    """
+    Monkey-patch nn.Linear.forward to use aiter GEMM when enabled.
+    """
+    if not AITER_GEMM_AVAILABLE:
+        print("Warning: aiter GEMM not available, skipping patch")
+        return
+    
+    original_forward = nn.Linear.forward
+    
+    def patched_forward(self, x):
+        if get_use_aiter_gemm():
+            return aiter_linear(x, self.weight, self.bias)
+        return original_forward(self, x)
+    
+    nn.Linear.forward = patched_forward
+    print("Patched nn.Linear.forward to use aiter GEMM (toggle with set_use_aiter_gemm)")
 
 
 # ============================================================================

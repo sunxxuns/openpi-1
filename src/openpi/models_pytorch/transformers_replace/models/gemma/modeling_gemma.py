@@ -46,6 +46,7 @@ def get_use_aiter_attention() -> bool:
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -62,7 +63,13 @@ from ...modeling_outputs import (
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from ...utils import auto_docstring, can_return_tuple, logging
+from typing import TypedDict
+try:
+    from ...utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
 from .configuration_gemma import GemmaConfig
 
 
@@ -145,6 +152,17 @@ class GemmaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # Fused path: single GEMM for gate+up (reduces 2 GEMMs to 1)
+        if hasattr(self, "_use_fused") and self._use_fused and hasattr(self, "_fused_gate_up_weight"):
+            gate_up = F.linear(x, self._fused_gate_up_weight)
+            if hasattr(self, "_gelu_tanh_and_mul"):
+                hidden = self._gelu_tanh_and_mul(gate_up)
+            else:
+                gate = gate_up[..., : self.intermediate_size]
+                up = gate_up[..., self.intermediate_size :]
+                hidden = self.act_fn(gate) * up
+            return self.down_proj(hidden)
+
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -319,12 +337,22 @@ def aiter_attention_forward(
             module, query, key, value, attention_mask, scaling, dropout, **kwargs
         )
     
+    # Optional override to skip expensive mask checks (benchmarking only)
+    mask_override = getattr(module, "_aiter_mask_type", None)
+    if mask_override == "eager":
+        return eager_attention_forward(
+            module, query, key, value, attention_mask, scaling, dropout, **kwargs
+        )
+    
     # Check if we can use flash attention
     # Flash attention only supports: pure causal OR full bidirectional (no padding mask)
     can_use_flash = False
     use_causal = True
     
-    if attention_mask is None:
+    if mask_override in ("full", "causal"):
+        can_use_flash = True
+        use_causal = mask_override == "causal"
+    elif attention_mask is None:
         # No mask = full bidirectional, can use flash
         can_use_flash = True
         use_causal = False
@@ -425,9 +453,25 @@ class GemmaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Check if fused QKV weights are available (reduces 3 GEMMs to 1)
+        if hasattr(self, "_use_fused_qkv") and self._use_fused_qkv and hasattr(self, "_fused_qkv_weight"):
+            q_size = self.q_proj.weight.shape[0]
+            k_size = self.k_proj.weight.shape[0]
+            qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
+            query_states = qkv_states[..., :q_size].view(hidden_shape).transpose(1, 2)
+            key_states = qkv_states[..., q_size:q_size + k_size].view(hidden_shape).transpose(1, 2)
+            value_states = qkv_states[..., q_size + k_size:].view(hidden_shape).transpose(1, 2)
+        # Check if fused KV weights are available (reduces 2 GEMMs to 1)
+        elif hasattr(self, "_use_fused_kv") and self._use_fused_kv and hasattr(self, "_fused_kv_weight"):
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            kv_size = self.k_proj.weight.shape[0]
+            kv_states = F.linear(hidden_states, self._fused_kv_weight)
+            key_states = kv_states[..., :kv_size].view(hidden_shape).transpose(1, 2)
+            value_states = kv_states[..., kv_size:].view(hidden_shape).transpose(1, 2)
+        else:
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)

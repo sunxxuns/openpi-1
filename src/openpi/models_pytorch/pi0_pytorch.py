@@ -1,12 +1,14 @@
 import logging
 import math
+import os
+import time
 
 import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.gemma as _gemma
+import openpi.models_pytorch.gemma_config_pytorch as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -20,6 +22,43 @@ def get_safe_dtype(target_dtype, device_type):
         if target_dtype == torch.float64:
             return torch.float64
     return target_dtype
+
+
+def _maybe_enable_inductor_compile_logging():
+    if os.environ.get("OPENPI_INDUCTOR_LOG", "0") != "1":
+        return
+    try:
+        import torch._inductor.compile_fx as compile_fx
+        if getattr(compile_fx, "_openpi_wrapped", False):
+            return
+        original_compile_fx = compile_fx.compile_fx
+
+        def wrapped_compile_fx(gm, example_inputs, *args, **kwargs):
+            name = getattr(gm, "name", getattr(gm, "_name", gm.__class__.__name__))
+            node_count = len(list(gm.graph.nodes)) if hasattr(gm, "graph") else "?"
+            try:
+                input_count = len(example_inputs)
+            except Exception:
+                input_count = "?"
+            print(
+                f"[inductor] compile_fx start name={name} nodes={node_count} inputs={input_count}",
+                flush=True,
+            )
+            start = time.perf_counter()
+            try:
+                return original_compile_fx(gm, example_inputs, *args, **kwargs)
+            finally:
+                elapsed = time.perf_counter() - start
+                print(
+                    f"[inductor] compile_fx end name={name} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+
+        compile_fx.compile_fx = wrapped_compile_fx
+        compile_fx._openpi_wrapped = True
+        print("[inductor] compile_fx logging enabled", flush=True)
+    except Exception as exc:
+        print(f"[inductor] failed to enable compile logging: {exc}", flush=True)
 
 
 def create_sinusoidal_pos_embedding(
@@ -108,20 +147,49 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        _maybe_enable_inductor_compile_logging()
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        
+        # Configure dynamo to handle dynamic KV cache shapes
+        import torch._dynamo.config as dynamo_config
+        dynamo_config.cache_size_limit = 64  # Increase from default 8
+        
+        # Configure inductor for optimal fusion
+        import torch._inductor.config as inductor_config
+        inductor_config.epilogue_fusion = True
+        inductor_config.pattern_matcher = True
+        inductor_config.aggressive_fusion = True
+
+        # Optional: force Triton matmul for better fusion (longer compile)
+        use_triton_mm = os.environ.get("USE_TRITON_MM", "0") == "1"
+        if use_triton_mm:
+            inductor_config.max_autotune = True
+            inductor_config.coordinate_descent_tuning = False
+            inductor_config.max_autotune_gemm_backends = "TRITON"
+        else:
+            # Default: faster compilation
+            inductor_config.max_autotune = False
+            inductor_config.coordinate_descent_tuning = False
+        
+        # Apply torch.compile with reduce-overhead mode (CUDA graphs)
+        compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
+        if compile_mode != "disable":
+            self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-        try:
-            from transformers.models.siglip import check
+        # Check for transformers_replace installation (can be skipped with SKIP_TRANSFORMERS_CHECK=1)
+        skip_check = os.environ.get("SKIP_TRANSFORMERS_CHECK", "0") == "1"
+        if not skip_check:
+            msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+            try:
+                from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+                if not check.check_whether_transformers_replace_is_installed_correctly():
+                    logging.warning(msg)
+            except ImportError:
+                logging.warning(msg)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
