@@ -14,7 +14,7 @@ python scripts/benchmark_policy_inference.py
 
 ## Full Policy Inference (batch=1, torch.compile)
 
-Benchmark on gfx950 (MI355X) with fused projections + aiter GEMM enabled.
+Benchmark on MI350 (gfx950) with fused projections + aiter GEMM enabled.
 Mask override is used to skip expensive mask classification in aiter attention (benchmark-only).
 
 ```bash
