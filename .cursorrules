@@ -1,0 +1,5 @@
+do not reinstall pytorch, as the default pytorch is working for current mi350 hw.
+the purpose is to get the amd perf compared with h200 (in h200-bench branch done on another machine)
+the targeted workload pi cares is the bench of full inference policy,
+i was working with mi350 machine on amd-bench branch or main branch but the machine is cutoff
+check md file to understand where we were, and the most recent commit

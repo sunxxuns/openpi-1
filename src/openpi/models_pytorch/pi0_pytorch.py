@@ -25,40 +25,177 @@ def get_safe_dtype(target_dtype, device_type):
 
 
 def _maybe_enable_inductor_compile_logging():
-    if os.environ.get("OPENPI_INDUCTOR_LOG", "0") != "1":
+    """Enable detailed inductor logging for debugging torch.compile on AMD MI350.
+    
+    Set OPENPI_INDUCTOR_LOG=1 to enable basic logging.
+    Set OPENPI_INDUCTOR_LOG=2 for verbose logging (includes graph structure).
+    """
+    log_level = os.environ.get("OPENPI_INDUCTOR_LOG", "0")
+    if log_level == "0":
         return
+    
+    verbose = log_level == "2"
+    
     try:
         import torch._inductor.compile_fx as compile_fx
         if getattr(compile_fx, "_openpi_wrapped", False):
             return
         original_compile_fx = compile_fx.compile_fx
+        
+        # Track compilation stats
+        compile_stats = {"count": 0, "total_time": 0.0, "graphs": []}
 
         def wrapped_compile_fx(gm, example_inputs, *args, **kwargs):
+            nonlocal compile_stats
+            compile_stats["count"] += 1
+            graph_id = compile_stats["count"]
+            
             name = getattr(gm, "name", getattr(gm, "_name", gm.__class__.__name__))
             node_count = len(list(gm.graph.nodes)) if hasattr(gm, "graph") else "?"
+            
+            # Get input shapes for debugging
+            input_shapes = []
             try:
-                input_count = len(example_inputs)
+                for inp in example_inputs:
+                    if hasattr(inp, "shape"):
+                        input_shapes.append(tuple(inp.shape))
+                    else:
+                        input_shapes.append(type(inp).__name__)
             except Exception:
-                input_count = "?"
+                input_shapes = ["?"]
+            
             print(
-                f"[inductor] compile_fx start name={name} nodes={node_count} inputs={input_count}",
+                f"[inductor] #{graph_id} compile_fx START name={name} nodes={node_count} inputs={input_shapes}",
                 flush=True,
             )
+            
+            # Log graph structure in verbose mode
+            if verbose and hasattr(gm, "graph"):
+                print(f"[inductor] #{graph_id} graph ops:", flush=True)
+                op_counts = {}
+                for node in gm.graph.nodes:
+                    op = f"{node.op}:{node.target}" if node.op == "call_function" else node.op
+                    op_counts[op] = op_counts.get(op, 0) + 1
+                for op, count in sorted(op_counts.items(), key=lambda x: -x[1])[:10]:
+                    print(f"  {op}: {count}", flush=True)
+            
             start = time.perf_counter()
             try:
-                return original_compile_fx(gm, example_inputs, *args, **kwargs)
-            finally:
+                result = original_compile_fx(gm, example_inputs, *args, **kwargs)
                 elapsed = time.perf_counter() - start
+                compile_stats["total_time"] += elapsed
+                compile_stats["graphs"].append({"name": name, "nodes": node_count, "time": elapsed})
                 print(
-                    f"[inductor] compile_fx end name={name} elapsed={elapsed:.1f}s",
+                    f"[inductor] #{graph_id} compile_fx END name={name} elapsed={elapsed:.1f}s (total: {compile_stats['total_time']:.1f}s)",
                     flush=True,
                 )
+                return result
+            except Exception as exc:
+                elapsed = time.perf_counter() - start
+                print(
+                    f"[inductor] #{graph_id} compile_fx FAILED name={name} elapsed={elapsed:.1f}s error={exc}",
+                    flush=True,
+                )
+                raise
 
         compile_fx.compile_fx = wrapped_compile_fx
         compile_fx._openpi_wrapped = True
-        print("[inductor] compile_fx logging enabled", flush=True)
+        print(f"[inductor] compile_fx logging enabled (verbose={verbose})", flush=True)
+        
+        # Also enable graph break logging (if available)
+        try:
+            import torch._dynamo.config as dynamo_config
+            if hasattr(dynamo_config, "log_graph_breaks"):
+                dynamo_config.log_graph_breaks = True
+                print("[inductor] graph break logging enabled", flush=True)
+        except Exception:
+            pass
+            
     except Exception as exc:
         print(f"[inductor] failed to enable compile logging: {exc}", flush=True)
+
+
+def _configure_inductor_for_amd():
+    """Configure torch inductor for AMD MI350 (ROCm).
+
+    This project previously experimented with enabling Inductor cudagraphs and forcing
+    Triton GEMM to reduce overhead. On MI350, benchmarks showed:
+    - **rocBLAS (ATen GEMM) is typically 35-55% faster than Triton GEMM**
+    - Inductor/graph-based "reduce-overhead" paths can be unstable on ROCm depending
+      on what libraries are used (e.g. capture limitations).
+
+    So the default here is MI350-safe:
+    - GEMMs: prefer ATen/rocBLAS
+    - Elementwise: allow Triton fusion/epilogues
+    - Inductor cudagraphs: disabled by default (can be re-enabled via env)
+    """
+    try:
+        import torch._inductor.config as inductor_config
+        import torch._dynamo.config as dynamo_config
+        
+        # Check if we're on ROCm
+        is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+        
+        if is_rocm:
+            rocm_version = torch.version.hip or "0.0"
+            print(f"[inductor] Detected ROCm {rocm_version}, applying MI350-safe config", flush=True)
+
+            # -----------------------------------------------------------------
+            # Graphs (Inductor-level): OFF by default on ROCm
+            # -----------------------------------------------------------------
+            # If you want to experiment, set OPENPI_ENABLE_INDUCTOR_CUDAGRAPHS=1
+            enable_graphs = os.environ.get("OPENPI_ENABLE_INDUCTOR_CUDAGRAPHS", "0") == "1"
+            inductor_config.triton.cudagraphs = bool(enable_graphs)
+            inductor_config.triton.cudagraph_trees = bool(enable_graphs)
+            if enable_graphs and hasattr(inductor_config.triton, "cudagraph_skip_autotuning"):
+                inductor_config.triton.cudagraph_skip_autotuning = True
+
+            # -----------------------------------------------------------------
+            # GEMM: prefer ATen/rocBLAS
+            # -----------------------------------------------------------------
+            inductor_config.max_autotune_gemm_backends = "ATEN"
+            inductor_config.max_autotune = False
+            inductor_config.coordinate_descent_tuning = False
+
+            # -----------------------------------------------------------------
+            # Fusion: keep the good defaults (avoid over-fusing huge graphs)
+            # -----------------------------------------------------------------
+            inductor_config.epilogue_fusion = True
+            inductor_config.pattern_matcher = True
+            inductor_config.aggressive_fusion = False
+            if hasattr(inductor_config.triton, "multi_kernel"):
+                inductor_config.triton.multi_kernel = 1
+
+            # -----------------------------------------------------------------
+            # Memory planning
+            # -----------------------------------------------------------------
+            if hasattr(inductor_config, "reorder_for_locality"):
+                inductor_config.reorder_for_locality = True
+            if hasattr(inductor_config, "memory_planning"):
+                inductor_config.memory_planning = True
+
+            # -----------------------------------------------------------------
+            # Dynamo cache / compilation overhead
+            # -----------------------------------------------------------------
+            dynamo_config.cache_size_limit = max(getattr(dynamo_config, "cache_size_limit", 64), 128)
+            dynamo_config.suppress_errors = False
+
+            # -----------------------------------------------------------------
+            # HIP runtime knobs
+            # -----------------------------------------------------------------
+            os.environ.setdefault("HIP_LAUNCH_BLOCKING", "0")
+            os.environ.setdefault("AMD_LOG_LEVEL", "0")
+            os.environ.setdefault("HIP_CACHE_ENABLED", "1")
+
+            print("[inductor] MI350 config applied:", flush=True)
+            print(f"  - Inductor cudagraphs: {inductor_config.triton.cudagraphs}", flush=True)
+            print("  - GEMM backend: ATEN (rocBLAS)", flush=True)
+            print(f"  - aggressive_fusion: {inductor_config.aggressive_fusion}", flush=True)
+        else:
+            print("[inductor] CUDA detected, using default optimizations", flush=True)
+            
+    except Exception as exc:
+        print(f"[inductor] failed to configure AMD optimizations: {exc}", flush=True)
 
 
 def create_sinusoidal_pos_embedding(
@@ -153,26 +290,34 @@ class PI0Pytorch(nn.Module):
         # Configure dynamo to handle dynamic KV cache shapes
         import torch._dynamo.config as dynamo_config
         dynamo_config.cache_size_limit = 64  # Increase from default 8
+        dynamo_config.suppress_errors = False  # Surface errors for debugging
         
-        # Configure inductor for optimal fusion
+        # Apply AMD-specific inductor optimizations
+        _configure_inductor_for_amd()
+        
+        # Additional inductor config (can be overridden by env vars)
         import torch._inductor.config as inductor_config
-        inductor_config.epilogue_fusion = True
-        inductor_config.pattern_matcher = True
-        inductor_config.aggressive_fusion = True
-
+        
         # Optional: force Triton matmul for better fusion (longer compile)
         use_triton_mm = os.environ.get("USE_TRITON_MM", "0") == "1"
         if use_triton_mm:
             inductor_config.max_autotune = True
             inductor_config.coordinate_descent_tuning = False
             inductor_config.max_autotune_gemm_backends = "TRITON"
-        else:
-            # Default: faster compilation
-            inductor_config.max_autotune = False
-            inductor_config.coordinate_descent_tuning = False
         
-        # Apply torch.compile with reduce-overhead mode (CUDA graphs)
-        compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
+        # Apply torch.compile with appropriate mode
+        # - "reduce-overhead": Uses CUDA graphs (faster on both CUDA and ROCm)
+        # - "default": Standard compilation (slower but more stable)
+        # - "max-autotune": Most optimized but slowest compile
+        # - "disable": Skip torch.compile entirely
+        is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+        # On ROCm, "reduce-overhead" is frequently a footgun (graph capture limitations).
+        # Default to "default" unless the user explicitly overrides via env.
+        default_mode = "default" if is_rocm else "reduce-overhead"
+        compile_mode = os.environ.get("TORCH_COMPILE_MODE", default_mode)
+        is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+        if is_rocm:
+            print(f"[torch.compile] ROCm detected, mode={compile_mode}", flush=True)
         if compile_mode != "disable":
             self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
 
@@ -467,11 +612,13 @@ class PI0Pytorch(nn.Module):
         )
 
         dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        dt_tensor = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
+        # Use for loop instead of while to avoid torch.compile recursion issues
+        # The while loop `while time >= -dt / 2` runs exactly num_steps iterations
+        for step in range(num_steps):
+            time = torch.tensor(1.0 + step * dt, dtype=torch.float32, device=device)
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
@@ -482,8 +629,7 @@ class PI0Pytorch(nn.Module):
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
-            time += dt
+            x_t = x_t + dt_tensor * v_t
         return x_t
 
     def denoise_step(

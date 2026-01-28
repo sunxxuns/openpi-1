@@ -28,8 +28,11 @@ os.environ.setdefault("USE_FUSED_PROJECTIONS", "1")
 os.environ.setdefault("USE_AITER_GEMM", "1")
 os.environ.setdefault("USE_OPTIMIZED_OPS", "1")
 os.environ.setdefault("AITER_MASK_OVERRIDE", "1")
+os.environ.setdefault("AITER_EXPERT_MASK_TYPE", "eager")  # eager|full (benchmark-only)
 os.environ.setdefault("OPENPI_INDUCTOR_LOG", "0")
 os.environ.setdefault("AUTO_PATCH_TRANSFORMERS", "1")
+os.environ.setdefault("OPENPI_MANUAL_CUDAGRAPH", "0")  # capture+replay full sample_actions (best effort)
+os.environ.setdefault("AITER_PRESHUFFLE_WEIGHTS", "0")  # enable bpreshuffle for eligible Linear weights
 
 
 def _maybe_patch_transformers():
@@ -93,12 +96,17 @@ def main():
             from openpi.models_pytorch.aiter_ops import (
                 set_use_aiter_gemm,
                 patch_linear_forward,
+                preshuffle_linear_weights_for_aiter,
                 AITER_GEMM_AVAILABLE,
             )
             if AITER_GEMM_AVAILABLE:
                 set_use_aiter_gemm(True)
                 patch_linear_forward()
                 print("Enabled aiter GEMM for optimized matrix multiply")
+
+                if os.environ.get("AITER_PRESHUFFLE_WEIGHTS", "0") == "1":
+                    count = preshuffle_linear_weights_for_aiter(model)
+                    print(f"Pre-shuffled {count} Linear weights for aiter (bpreshuffle)")
             else:
                 print("Warning: aiter GEMM not available")
         except Exception as e:
@@ -114,17 +122,20 @@ def main():
     # Skip expensive mask checks in aiter attention (benchmark-only)
     if os.environ.get("AITER_MASK_OVERRIDE", "0") == "1":
         try:
+            expert_mask_type = os.environ.get("AITER_EXPERT_MASK_TYPE", "eager")
             for layer in model.paligemma_with_expert.paligemma.language_model.layers:
                 layer.self_attn._aiter_mask_type = "full"  # full bidirectional
             for layer in model.paligemma_with_expert.gemma_expert.model.layers:
-                layer.self_attn._aiter_mask_type = "eager"  # complex mask, skip flash path
-            print("Applied aiter mask overrides (full/eager)")
+                layer.self_attn._aiter_mask_type = expert_mask_type
+            print(f"Applied aiter mask overrides (full/{expert_mask_type})")
         except Exception as e:
             print(f"Warning: Could not apply aiter mask overrides: {e}")
     model.eval()
     
     # torch.compile is applied in PI0Pytorch.__init__ with mode from TORCH_COMPILE_MODE env var
-    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
+    is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+    default_mode = "default" if is_rocm else "reduce-overhead"
+    compile_mode = os.environ.get("TORCH_COMPILE_MODE", default_mode)
     print(f"torch.compile mode: {compile_mode}")
     
     param_count = sum(p.numel() for p in model.parameters()) / 1e9
@@ -181,6 +192,49 @@ def main():
         with torch.no_grad():
             _ = model.sample_actions(device, observation, num_steps=num_steps)
     torch.cuda.synchronize()
+
+    # Optional: manual cudagraph capture+replay to reduce CPU/launch overhead
+    # (This is separate from Inductor cudagraphs; it captures the entire callable.)
+    use_manual_graph = os.environ.get("OPENPI_MANUAL_CUDAGRAPH", "0") == "1"
+    graph = None
+    static_actions = None
+    static_noise = None
+    if use_manual_graph:
+        print("\nManual CUDAGraph capture enabled (OPENPI_MANUAL_CUDAGRAPH=1)")
+        try:
+            # Make ROCm graph capture work with torch.compile by skipping CUDA RNG
+            # state preservation inside Dynamo while a stream capture is active.
+            try:
+                from openpi.models_pytorch.rocm_cudagraph_dynamo_patch import (
+                    patch_dynamo_preserve_global_state_for_rocm_cudagraph_capture,
+                )
+
+                patch_dynamo_preserve_global_state_for_rocm_cudagraph_capture()
+            except Exception:
+                pass
+
+            # Use a private pool so allocations during capture are replay-safe.
+            pool = torch.cuda.graphs.graph_pool_handle()
+            graph = torch.cuda.CUDAGraph()
+
+            # Warm up with the *exact* callable we will capture/replay.
+            with torch.no_grad():
+                for _ in range(5):
+                    _ = model.sample_actions(device, observation, num_steps=num_steps)
+            torch.cuda.synchronize()
+
+            print("Capturing graph (1 iteration)...")
+            with torch.cuda.graph(graph, pool=pool):
+                static_actions = model.sample_actions(device, observation, num_steps=num_steps)
+            torch.cuda.synchronize()
+            print("Graph capture succeeded.")
+        except Exception as e:
+            import traceback
+
+            print(f"Warning: manual CUDAGraph capture failed, falling back to normal run: {e}")
+            traceback.print_exc()
+            graph = None
+            static_actions = None
     
     # Optional profiling (set PROFILE=1)
     if os.environ.get("PROFILE", "0") == "1":
@@ -210,7 +264,11 @@ def main():
         torch.cuda.synchronize()
         start = time.perf_counter()
         with torch.no_grad():
-            actions = model.sample_actions(device, observation, num_steps=num_steps)
+            if graph is not None:
+                graph.replay()
+                actions = static_actions
+            else:
+                actions = model.sample_actions(device, observation, num_steps=num_steps)
         torch.cuda.synchronize()
         end = time.perf_counter()
         latencies.append((end - start) * 1000)

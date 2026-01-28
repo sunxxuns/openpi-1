@@ -26,11 +26,12 @@ Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels.
 
 | Configuration | Latency | Throughput | Memory |
 |---------------|---------|------------|--------|
-| AMD MI350 (Aiter) | 142.0 ms | 7.04 Hz | 7.10 GB |
+| AMD MI350 (eager) | 137.3 ms | 7.28 Hz | 7.10 GB |
 | NVIDIA H200 (eager) | 120.8 ms | 8.28 Hz | 7.06 GB |
+| **AMD MI350 (torch.compile)** | **35.7 ms** | **28.04 Hz** | 10.03 GB |
 | **NVIDIA H200 (torch.compile)** | **32.9 ms** | **30.44 Hz** | 7.03 GB |
 
-**Result:** H200 with torch.compile is **4.3x faster** than MI350, **3.7x faster** than eager mode
+**Result:** With torch.compile, MI350 is only **~8% slower** than H200 (35.7ms vs 32.9ms). Both achieve **~4x speedup** over eager mode.
 
 ### 8-GPU DDP Training (3.3B Model)
 
@@ -45,8 +46,8 @@ Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels.
 
 ### Analysis
 
-- **Inference with torch.compile:** Fuses operations into optimized Triton kernels, reducing launch overhead by 3.7x
-- **Inference (eager):** H200 benefits from Hopper tensor cores (`nvjet_sm90_*` kernels) and HBM3e bandwidth
+- **Inference (torch.compile):** Both platforms achieve ~4x speedup; MI350 is only ~8% slower than H200
+- **Inference (eager):** H200 is ~12% faster due to Hopper tensor cores and HBM3e bandwidth
 - **Training:** MI350's Aiter Flash Attention + Triton kernels are optimized for backward pass operations
 
 For detailed results, trace files, and benchmark scripts, see [BENCHMARK_H200.md](BENCHMARK_H200.md). 

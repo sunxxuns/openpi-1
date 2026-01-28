@@ -343,44 +343,23 @@ def aiter_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = Non
     """
     Linear layer using aiter's optimized GEMM kernels.
     
-    Uses ASM kernels for QKV-like shapes where K == N (1.3-1.7x faster).
-    Uses F.linear for MLP shapes where it's faster.
+    Prefer aiter's tuned GEMM dispatcher (`aiter.tuned_gemm.gemm_a16w16`) which
+    selects among asm/skinny/hipblaslt/torch per-shape based on tuned configs.
     """
     if not AITER_GEMM_AVAILABLE:
         return F.linear(x, weight, bias)
-    
-    # Handle batched input
-    orig_shape = x.shape
-    x_2d = x.view(-1, x.shape[-1]) if x.dim() >= 3 else x
-    
-    _, k_dim = x_2d.shape
-    n_dim = weight.shape[0]
-    
-    # Use ASM only for square-ish shapes (QKV projections) where it's faster
-    # Criteria: K == N, both divisible by 64, BF16, no bias
-    use_asm = (
-        x.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
-        and k_dim == n_dim
-        and n_dim % 64 == 0
-        and k_dim % 64 == 0
-        and bias is None
-    )
-    
-    if use_asm:
-        try:
-            from aiter import gemm_a16w16_asm
-            out = torch.empty(x_2d.shape[0], n_dim, dtype=torch.float32, device=x.device)
-            gemm_a16w16_asm(x_2d, weight, out, None, None, None, False)
-            out = out.to(torch.bfloat16)
-            if len(orig_shape) >= 3:
-                out = out.view(*orig_shape[:-1], -1)
-            return out
-        except Exception:
-            pass  # Fall back to F.linear
-    
-    out = F.linear(x, weight, bias)
-    return out
+
+    # Only route bf16/fp16 through tuned GEMM for now.
+    # (Other dtypes fall back to PyTorch.)
+    if x.dtype not in (torch.bfloat16, torch.float16) or weight.dtype != x.dtype:
+        return F.linear(x, weight, bias)
+
+    try:
+        # `gemm_a16w16` expects B as [N, K] (nn.Linear.weight layout).
+        return gemm_a16w16(x, weight, bias=bias, otype=x.dtype)
+    except Exception:
+        # Conservative fallback (never fail correctness)
+        return F.linear(x, weight, bias)
 
 
 class AiterLinear(nn.Module):
@@ -473,11 +452,59 @@ def patch_linear_forward():
     
     def patched_forward(self, x):
         if get_use_aiter_gemm():
-            return aiter_linear(x, self.weight, self.bias)
+            w = getattr(self, "_aiter_preshuffled_weight", self.weight)
+            return aiter_linear(x, w, self.bias)
         return original_forward(self, x)
     
     nn.Linear.forward = patched_forward
     print("Patched nn.Linear.forward to use aiter GEMM (toggle with set_use_aiter_gemm)")
+
+
+def preshuffle_linear_weights_for_aiter(
+    model: nn.Module,
+    *,
+    require_multiple: int = 256,
+    layout: tuple[int, int] = (16, 16),
+) -> int:
+    """Pre-shuffle eligible Linear weights for aiter GEMM on gfx950.
+
+    aiter's bf16 asm GEMM path can use pre-shuffled weights (bpreshuffle=True) to
+    enable faster kernels on MI350-class GPUs. We keep the original `.weight`
+    intact and stash the shuffled version on the module to avoid breaking any
+    non-Linear codepaths that might directly read `.weight`.
+    """
+    if not AITER_GEMM_AVAILABLE:
+        return 0
+
+    try:
+        from aiter.ops.shuffle import shuffle_weight
+    except Exception:
+        return 0
+
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if module.bias is not None:
+            continue
+        w = module.weight
+        if w.dtype != torch.bfloat16:
+            continue
+        if w.ndim != 2:
+            continue
+        n, k = w.shape
+        if n % require_multiple != 0 or k % require_multiple != 0:
+            continue
+        if hasattr(module, "_aiter_preshuffled_weight"):
+            continue
+        try:
+            w_shuf = shuffle_weight(w, layout=layout)
+            module._aiter_preshuffled_weight = w_shuf  # type: ignore[attr-defined]
+            count += 1
+        except Exception:
+            # Conservative: if any layer can't be shuffled, skip it.
+            continue
+    return count
 
 
 # ============================================================================
