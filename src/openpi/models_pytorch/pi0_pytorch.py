@@ -162,9 +162,12 @@ def _configure_inductor_for_amd():
             # -----------------------------------------------------------------
             inductor_config.epilogue_fusion = True
             inductor_config.pattern_matcher = True
-            inductor_config.aggressive_fusion = False
+            # Allow experiments: more fusion can reduce kernel count (helps hipGraphLaunch)
+            # but may also regress kernel quality on ROCm. Default remains conservative.
+            inductor_config.aggressive_fusion = os.environ.get("OPENPI_AGGRESSIVE_FUSION", "0") == "1"
             if hasattr(inductor_config.triton, "multi_kernel"):
-                inductor_config.triton.multi_kernel = 1
+                # multi_kernel>1 can reduce launch count for some patterns; keep default=1
+                inductor_config.triton.multi_kernel = int(os.environ.get("OPENPI_TRITON_MULTI_KERNEL", "1"))
 
             # -----------------------------------------------------------------
             # Memory planning
@@ -172,7 +175,12 @@ def _configure_inductor_for_amd():
             if hasattr(inductor_config, "reorder_for_locality"):
                 inductor_config.reorder_for_locality = True
             if hasattr(inductor_config, "memory_planning"):
-                inductor_config.memory_planning = True
+                # On ROCm, Inductor's memory_planning can hit deep recursion for very
+                # large graphs (seen when compiling through attention). Keep enabled
+                # by default, but allow disabling for stability experiments.
+                inductor_config.memory_planning = os.environ.get(
+                    "OPENPI_INDUCTOR_MEMORY_PLANNING", "1"
+                ) == "1"
 
             # -----------------------------------------------------------------
             # Dynamo cache / compilation overhead
@@ -612,14 +620,26 @@ class PI0Pytorch(nn.Module):
         )
 
         dt = -1.0 / num_steps
-        dt_tensor = torch.tensor(dt, dtype=torch.float32, device=device)
+        # CUDAGraph-capture friendly: avoid creating new tensors during capture.
+        # Use Python scalar for dt and cache the timestep schedule tensor.
+        times_key = (str(device), int(num_steps))
+        times = getattr(self, "_openpi_sample_actions_times", None)
+        if not isinstance(times, dict) or times.get("key") != times_key:
+            # Construct once (outside capture) then reuse.
+            # Note: this allocates; safe as long as first call happens before capture.
+            t0 = 1.0
+            # times[step] = 1.0 + step*dt
+            t = torch.arange(num_steps, device=device, dtype=torch.float32) * float(dt) + float(t0)
+            times = {"key": times_key, "t": t}
+            setattr(self, "_openpi_sample_actions_times", times)
+        t_schedule = times["t"]
 
         x_t = noise
         # Use for loop instead of while to avoid torch.compile recursion issues
         # The while loop `while time >= -dt / 2` runs exactly num_steps iterations
         for step in range(num_steps):
-            time = torch.tensor(1.0 + step * dt, dtype=torch.float32, device=device)
-            expanded_time = time.expand(bsize)
+            # Use cached scalar timestep tensor; expand is a view.
+            expanded_time = t_schedule[step].expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -629,7 +649,7 @@ class PI0Pytorch(nn.Module):
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt_tensor * v_t
+            x_t = x_t + (dt * v_t)
         return x_t
 
     def denoise_step(

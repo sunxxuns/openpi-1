@@ -329,17 +329,41 @@ def aiter_attention_forward(
     
     q_len = query.shape[2]
     k_len = key.shape[2]
+
+    # Debug: print which path we take (flash vs eager) for the first few calls.
+    # Guard against running during torch.compile tracing.
+    try:
+        import os as _os
+        import torch as _torch
+
+        _debug = _os.environ.get("OPENPI_DEBUG_AITER_ATTN", "0") == "1"
+        _debug_limit = int(_os.environ.get("OPENPI_DEBUG_AITER_ATTN_LIMIT", "8"))
+        _is_compiling = False
+        try:
+            _is_compiling = bool(getattr(_torch._dynamo, "is_compiling", lambda: False)())
+        except Exception:
+            _is_compiling = False
+    except Exception:
+        _debug = False
+        _debug_limit = 0
+        _is_compiling = False
     
-    # For cross-attention with KV cache (Q_len != K_len), flash attention's causal mode
-    # doesn't work correctly. Fall back to eager.
-    if q_len != k_len:
-        return eager_attention_forward(
-            module, query, key, value, attention_mask, scaling, dropout, **kwargs
-        )
+    # Note: q_len != k_len commonly happens for self-attention with KV cache
+    # (queries are the newly appended tokens; keys/values include cached prefix).
+    # Flash attention kernels support q_len != k_len for both causal and non-causal
+    # modes, but we do not support arbitrary rectangular masks here.
     
     # Optional override to skip expensive mask checks (benchmarking only)
     mask_override = getattr(module, "_aiter_mask_type", None)
     if mask_override == "eager":
+        if _debug and not _is_compiling:
+            cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+            if cnt < _debug_limit:
+                print(
+                    f"[openpi][aiter_attn] FALLBACK eager (override) q_len={q_len} k_len={k_len} override={mask_override}",
+                    flush=True,
+                )
+            module._openpi_aiter_attn_dbg_cnt = cnt + 1
         return eager_attention_forward(
             module, query, key, value, attention_mask, scaling, dropout, **kwargs
         )
@@ -350,8 +374,14 @@ def aiter_attention_forward(
     use_causal = True
     
     if mask_override in ("full", "causal"):
+        # Explicit override wins (also enables q_len != k_len).
         can_use_flash = True
         use_causal = mask_override == "causal"
+        # For q_len != k_len, we do not attempt to validate arbitrary masks.
+        # Caller is responsible for only using this override when the effective
+        # mask is compatible with full attention (full) or causal-with-cache (causal).
+        if q_len != k_len and attention_mask is not None:
+            attention_mask = None
     elif attention_mask is None:
         # No mask = full bidirectional, can use flash
         can_use_flash = True
@@ -359,26 +389,39 @@ def aiter_attention_forward(
     elif attention_mask is not None:
         # Check if mask is pure causal (all -inf above diagonal, all 0 on/below)
         # or full bidirectional (all 0)
-        mask_2d = attention_mask[0, 0]  # [seq_len, seq_len]
-        unique_vals = torch.unique(mask_2d)
-        
-        if len(unique_vals) == 1 and unique_vals[0].item() == 0.0:
-            # All zeros = full bidirectional, can use flash
-            can_use_flash = True
-            use_causal = False
-        elif len(unique_vals) <= 2:
-            # Check if it's pure causal mask
-            is_lower_tri = torch.tril(torch.ones_like(mask_2d, dtype=torch.bool))
-            upper_vals = mask_2d[~is_lower_tri]
-            lower_vals = mask_2d[is_lower_tri]
-            
-            # Pure causal: upper triangle all -inf, lower triangle all 0
-            if (upper_vals < -1e9).all() and (lower_vals == 0).all():
+        # Only attempt this check for square masks (q_len == k_len).
+        if q_len != k_len:
+            can_use_flash = False
+        else:
+            mask_2d = attention_mask[0, 0]  # [seq_len, seq_len]
+            unique_vals = torch.unique(mask_2d)
+
+            if len(unique_vals) == 1 and unique_vals[0].item() == 0.0:
+                # All zeros = full bidirectional, can use flash
                 can_use_flash = True
-                use_causal = True
+                use_causal = False
+            elif len(unique_vals) <= 2:
+                # Check if it's pure causal mask
+                is_lower_tri = torch.tril(torch.ones_like(mask_2d, dtype=torch.bool))
+                upper_vals = mask_2d[~is_lower_tri]
+                lower_vals = mask_2d[is_lower_tri]
+
+                # Pure causal: upper triangle all -inf, lower triangle all 0
+                if (upper_vals < -1e9).all() and (lower_vals == 0).all():
+                    can_use_flash = True
+                    use_causal = True
     
     # Fall back to eager if mask is complex (e.g., has padding)
     if not can_use_flash:
+        if _debug and not _is_compiling:
+            cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+            if cnt < _debug_limit:
+                am = "none" if attention_mask is None else f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
+                print(
+                    f"[openpi][aiter_attn] FALLBACK eager q_len={q_len} k_len={k_len} override={mask_override} attn_mask={am}",
+                    flush=True,
+                )
+            module._openpi_aiter_attn_dbg_cnt = cnt + 1
         return eager_attention_forward(
             module, query, key, value, attention_mask, scaling, dropout, **kwargs
         )
@@ -387,23 +430,61 @@ def aiter_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
     
-    # Transpose to [batch, seq_len, num_heads, head_dim]
-    query_states = query.transpose(1, 2).contiguous()
-    key_states = key_states.transpose(1, 2).contiguous()
-    value_states = value_states.transpose(1, 2).contiguous()
+    # Transpose to [batch, seq_len, num_heads, head_dim].
+    # Important: do NOT force `.contiguous()` here. The last-dimension remains contiguous
+    # after this transpose (stride(-1) == 1), and forcing contiguous causes extra copies
+    # that show up as standalone to_copy / rope-related kernels in the replay trace.
+    query_states = query.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
     
     # Use aiter's flash attention
-    result = aiter.flash_attn_func(
-        query_states,
-        key_states,
-        value_states,
-        dropout_p=dropout if module.training else 0.0,
-        softmax_scale=scaling,
-        causal=use_causal,
-        return_lse=True,
-    )
-    
-    attn_output = result[0] if isinstance(result, tuple) else result
+    if _debug and not _is_compiling:
+        cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+        if cnt < _debug_limit:
+            print(
+                f"[openpi][aiter_attn] FLASH q_len={q_len} k_len={k_len} override={mask_override} causal={use_causal}",
+                flush=True,
+            )
+        module._openpi_aiter_attn_dbg_cnt = cnt + 1
+
+    # Prefer calling the underlying compiled op directly (more torch.compile friendly)
+    # instead of the higher-level python wrapper. This avoids extra python-side logic
+    # (padding, branching, returning LSE) during tracing/compilation.
+    use_direct_mha = os.environ.get("OPENPI_AITER_ATTN_DIRECT_MHA", "1") == "1"
+    attn_output = None
+    if use_direct_mha:
+        try:
+            from aiter.ops.mha import mha_fwd  # type: ignore
+
+            outs = mha_fwd(
+                query_states,
+                key_states,
+                value_states,
+                dropout if module.training else 0.0,
+                float(scaling),
+                bool(use_causal),
+                -1,
+                -1,
+                False,  # return_softmax_lse
+                False,  # return_dropout_randval
+            )
+            # aiter mha_fwd returns [out, lse, p, rng_state]
+            attn_output = outs[0]
+        except Exception:
+            attn_output = None
+
+    if attn_output is None:
+        result = aiter.flash_attn_func(
+            query_states,
+            key_states,
+            value_states,
+            dropout_p=dropout if module.training else 0.0,
+            softmax_scale=scaling,
+            causal=use_causal,
+            return_lse=True,
+        )
+        attn_output = result[0] if isinstance(result, tuple) else result
     return attn_output, None
 
 
@@ -489,6 +570,17 @@ class GemmaAttention(nn.Module):
         # Select attention implementation: aiter (if enabled) > config-specified > eager
         if get_use_aiter_attention():
             attention_interface: Callable = aiter_attention_forward
+            # ROCm note: compiling through flash-attn can trigger inductor issues for
+            # some q_len!=k_len (KV-cache) cases. By default, keep aiter attention
+            # outside torch.compile (graph break), while still allowing CUDAGraph
+            # capture/replay to remove Python/launch overhead.
+            try:
+                if os.environ.get("OPENPI_DISABLE_COMPILE_AITER_ATTN", "1") == "1":
+                    import torch._dynamo as _dynamo  # type: ignore
+
+                    attention_interface = _dynamo.disable(attention_interface)
+            except Exception:
+                pass
         elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         else:

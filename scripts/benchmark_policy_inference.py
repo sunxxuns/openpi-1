@@ -33,6 +33,8 @@ os.environ.setdefault("OPENPI_INDUCTOR_LOG", "0")
 os.environ.setdefault("AUTO_PATCH_TRANSFORMERS", "1")
 os.environ.setdefault("OPENPI_MANUAL_CUDAGRAPH", "0")  # capture+replay full sample_actions (best effort)
 os.environ.setdefault("AITER_PRESHUFFLE_WEIGHTS", "0")  # enable bpreshuffle for eligible Linear weights
+os.environ.setdefault("OPENPI_NUMERIC_CHECK", "0")  # compare call vs graph replay numerics
+os.environ.setdefault("OPENPI_PROFILE_SHAPES", "0")  # print op tables grouped by input shapes
 
 
 def _maybe_patch_transformers():
@@ -43,7 +45,9 @@ def _maybe_patch_transformers():
         import transformers
 
         src = pathlib.Path(__file__).resolve().parents[1] / "src" / "openpi" / "models_pytorch" / "transformers_replace" / "models"
-        dest = pathlib.Path(transformers.__file__).resolve().parents[1] / "models"
+        # transformers.__file__ points at transformers/__init__.py
+        # We want <site-packages>/transformers/models/, i.e. parent is the transformers package dir.
+        dest = pathlib.Path(transformers.__file__).resolve().parent / "models"
         for child in src.iterdir():
             if child.is_dir():
                 shutil.copytree(child, dest / child.name, dirs_exist_ok=True)
@@ -193,6 +197,19 @@ def main():
             _ = model.sample_actions(device, observation, num_steps=num_steps)
     torch.cuda.synchronize()
 
+    # Optional: numeric check (call vs graph replay) using fixed noise
+    numeric_check = os.environ.get("OPENPI_NUMERIC_CHECK", "0") == "1"
+    fixed_noise = None
+    if numeric_check:
+        print("\nNumeric check enabled (OPENPI_NUMERIC_CHECK=1)")
+        # Make the reference and graph run identical by fixing the input noise.
+        torch.manual_seed(0)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(0)
+        fixed_noise = torch.randn(
+            batch_size, config.action_horizon, config.action_dim, device=device, dtype=torch.float32
+        )
+
     # Optional: manual cudagraph capture+replay to reduce CPU/launch overhead
     # (This is separate from Inductor cudagraphs; it captures the entire callable.)
     use_manual_graph = os.environ.get("OPENPI_MANUAL_CUDAGRAPH", "0") == "1"
@@ -220,12 +237,20 @@ def main():
             # Warm up with the *exact* callable we will capture/replay.
             with torch.no_grad():
                 for _ in range(5):
-                    _ = model.sample_actions(device, observation, num_steps=num_steps)
+                    _ = model.sample_actions(
+                        device, observation, noise=fixed_noise, num_steps=num_steps
+                    ) if numeric_check else model.sample_actions(
+                        device, observation, num_steps=num_steps
+                    )
             torch.cuda.synchronize()
 
             print("Capturing graph (1 iteration)...")
             with torch.cuda.graph(graph, pool=pool):
-                static_actions = model.sample_actions(device, observation, num_steps=num_steps)
+                static_actions = model.sample_actions(
+                    device, observation, noise=fixed_noise, num_steps=num_steps
+                ) if numeric_check else model.sample_actions(
+                    device, observation, num_steps=num_steps
+                )
             torch.cuda.synchronize()
             print("Graph capture succeeded.")
         except Exception as e:
@@ -235,12 +260,45 @@ def main():
             traceback.print_exc()
             graph = None
             static_actions = None
+
+    if numeric_check:
+        with torch.no_grad():
+            ref = model.sample_actions(device, observation, noise=fixed_noise, num_steps=num_steps)
+            torch.cuda.synchronize()
+
+            if graph is not None:
+                graph.replay()
+                got = static_actions
+                torch.cuda.synchronize()
+            else:
+                got = model.sample_actions(device, observation, noise=fixed_noise, num_steps=num_steps)
+                torch.cuda.synchronize()
+
+        ref_f = ref.float()
+        got_f = got.float()
+        diff = (ref_f - got_f).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        denom = ref_f.abs().clamp_min(1e-6)
+        max_rel = float((diff / denom).max().item())
+        print(f"Numeric check: max_abs={max_abs:.3e} mean_abs={mean_abs:.3e} max_rel={max_rel:.3e}")
+
+        # Tight-ish defaults for BF16 end-to-end; can be overridden.
+        atol = float(os.environ.get("OPENPI_NUMERIC_ATOL", "5e-2"))
+        rtol = float(os.environ.get("OPENPI_NUMERIC_RTOL", "5e-2"))
+        torch.testing.assert_close(got_f, ref_f, rtol=rtol, atol=atol)
+        print(f"Numeric check PASSED (rtol={rtol:g}, atol={atol:g})")
     
     # Optional profiling (set PROFILE=1)
     if os.environ.get("PROFILE", "0") == "1":
         trace_dir = os.environ.get("PROFILE_DIR", "traces")
         os.makedirs(trace_dir, exist_ok=True)
-        trace_path = os.path.join(trace_dir, f"policy_inference_compiled_{compile_mode}.json")
+        profile_replay = os.environ.get("PROFILE_GRAPH_REPLAY", "0") == "1"
+        profile_shapes = os.environ.get("OPENPI_PROFILE_SHAPES", "0") == "1"
+        trace_suffix = "replay" if (profile_replay and graph is not None) else "call"
+        trace_path = os.path.join(
+            trace_dir, f"policy_inference_compiled_{compile_mode}_{trace_suffix}.json"
+        )
         print("\nProfiling (1 iteration)...")
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -249,13 +307,27 @@ def main():
             with_flops=True,
         ) as prof:
             with torch.no_grad():
-                _ = model.sample_actions(device, observation, num_steps=num_steps)
+                if profile_replay and graph is not None:
+                    graph.replay()
+                    _ = static_actions
+                else:
+                    _ = model.sample_actions(device, observation, num_steps=num_steps)
             torch.cuda.synchronize()
         prof.export_chrome_trace(trace_path)
         trace_size_mb = os.path.getsize(trace_path) / 1024 / 1024
         print(f"Trace saved: {trace_path} ({trace_size_mb:.1f} MB)")
         print("\nTop ops by self CUDA time:")
         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+        if profile_shapes:
+            print("\nTop ops by self CUDA time (grouped by input shape):")
+            try:
+                print(
+                    prof.key_averages(group_by_input_shape=True).table(
+                        sort_by="self_cuda_time_total", row_limit=40
+                    )
+                )
+            except Exception as e:
+                print(f"(could not group by input shape: {e})")
 
     # Benchmark
     print("Benchmarking...")
