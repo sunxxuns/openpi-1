@@ -4,7 +4,7 @@ This is the **one command** you want on a fresh machine to reproduce the current
 
 ### Goal
 
-- **Current best (this repo, MI350)**: ~**31.5 ms** mean for `scripts/benchmark_policy_inference.py` (B1, 10 denoising steps)
+- **Current best (this repo, MI350)**: ~**31.2 ms** mean for `scripts/benchmark_policy_inference.py` (B1, 10 denoising steps)
 - **Perf/Watt target**: **23 ms** (to match H200 perf/watt at 700W vs MI350 1000W)
 
 ### What actually worked
@@ -15,6 +15,10 @@ This is the **one command** you want on a fresh machine to reproduce the current
   - ROCm capture can fail if Dynamo traces during capture because Dynamo saves CUDA RNG state.
   - We patch Dynamo at runtime (best-effort) to skip CUDA RNG get_state while a stream capture is active.
 - **GEMM**: route `nn.Linear` to **aiter tuned GEMM** dispatcher; optionally **pre-shuffle** eligible Linear weights to enable **bpreshuffle asm kernels** on gfx950.
+- **Attention (important)**: compile *through* aiter attention with the direct `mha_fwd` path.
+  - `OPENPI_DISABLE_COMPILE_AITER_ATTN=0`
+  - `OPENPI_AITER_ATTN_DIRECT_MHA=1`
+  - `OPENPI_INDUCTOR_MEMORY_PLANNING=0` (Inductor stability on ROCm; also reduces kernel count)
 
 ### Recommended environment
 
@@ -35,11 +39,14 @@ TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference.py
 ```
 
-Expected: **~31.5 ms** mean, **~31.7 Hz** throughput (on MI350).
+Expected: **~31.2 ms** mean, **~32 Hz** throughput (on MI350).
 
 ### Notes / caveats
 
 - **Memory**: `AITER_PRESHUFFLE_WEIGHTS=1` keeps both original + shuffled weights, so peak memory is higher.
 - **First run**: aiter may JIT/build some modules on first execution; benchmark uses warmup, but overall script runtime may be longer the first time.
 - **If capture fails**: the script prints a warning and falls back to normal execution. If that happens, rerun with a larger warmup, or disable manual graph and use compiled-only mode.
+- **If you see ~34-35ms again**: you likely re-enabled one of these (unset them):
+  - `OPENPI_DISABLE_COMPILE_AITER_ATTN=1` (graph-breaks around attention; increases kernel count)
+  - `OPENPI_INDUCTOR_MEMORY_PLANNING=1` (can trigger Inductor issues on ROCm / regresses kernel graph)
 

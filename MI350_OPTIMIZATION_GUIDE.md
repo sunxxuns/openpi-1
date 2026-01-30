@@ -32,10 +32,13 @@ The main target workload in this repo is:
 
 ### Current best result on MI350 (this repo)
 
-- **31.5 ms mean latency** using:
+- **~31.2 ms mean latency** using:
   - `TORCH_COMPILE_MODE=default`
   - `OPENPI_MANUAL_CUDAGRAPH=1` (manual full-call capture+replay)
   - `AITER_PRESHUFFLE_WEIGHTS=1` (pre-shuffle eligible Linear weights for bpreshuffle asm GEMM)
+  - `OPENPI_DISABLE_COMPILE_AITER_ATTN=0` (compile through aiter attention; avoids graph-break kernel bloat)
+  - `OPENPI_AITER_ATTN_DIRECT_MHA=1` (use `aiter.ops.mha.mha_fwd` fast path)
+  - `OPENPI_INDUCTOR_MEMORY_PLANNING=0` (ROCm stability + better kernel graph)
 
 Runbook: see `MI350_POLICY_INFERENCE_RUNBOOK.md`.
 

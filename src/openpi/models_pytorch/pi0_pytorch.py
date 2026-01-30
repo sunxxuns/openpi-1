@@ -177,9 +177,9 @@ def _configure_inductor_for_amd():
             if hasattr(inductor_config, "memory_planning"):
                 # On ROCm, Inductor's memory_planning can hit deep recursion for very
                 # large graphs (seen when compiling through attention). Keep enabled
-                # by default, but allow disabling for stability experiments.
+                # disabled by default for stability (can be re-enabled via env).
                 inductor_config.memory_planning = os.environ.get(
-                    "OPENPI_INDUCTOR_MEMORY_PLANNING", "1"
+                    "OPENPI_INDUCTOR_MEMORY_PLANNING", "0"
                 ) == "1"
 
             # -----------------------------------------------------------------
@@ -199,6 +199,8 @@ def _configure_inductor_for_amd():
             print(f"  - Inductor cudagraphs: {inductor_config.triton.cudagraphs}", flush=True)
             print("  - GEMM backend: ATEN (rocBLAS)", flush=True)
             print(f"  - aggressive_fusion: {inductor_config.aggressive_fusion}", flush=True)
+            if hasattr(inductor_config, "memory_planning"):
+                print(f"  - memory_planning: {inductor_config.memory_planning}", flush=True)
         else:
             print("[inductor] CUDA detected, using default optimizations", flush=True)
             

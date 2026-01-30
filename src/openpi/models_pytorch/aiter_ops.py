@@ -355,6 +355,16 @@ def aiter_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = Non
         return F.linear(x, weight, bias)
 
     try:
+        # Optional: split bias to unlock bpreshuffle/asm kernels.
+        #
+        # Some aiter fast paths effectively assume "bias-free GEMM". When bias is present,
+        # the dispatcher may fall back to a slower implementation. When enabled, we run
+        # GEMM with bias=None and add bias as a separate epilogue.
+        split_bias = os.environ.get("OPENPI_AITER_SPLIT_BIAS", "0") == "1"
+        if split_bias and bias is not None:
+            out = gemm_a16w16(x, weight, bias=None, otype=x.dtype)
+            return out + bias
+
         # `gemm_a16w16` expects B as [N, K] (nn.Linear.weight layout).
         return gemm_a16w16(x, weight, bias=bias, otype=x.dtype)
     except Exception:
@@ -482,10 +492,15 @@ def preshuffle_linear_weights_for_aiter(
         return 0
 
     count = 0
+    # Allow overriding divisibility requirements.
+    require_multiple = int(os.environ.get("AITER_PRESHUFFLE_REQUIRE_MULTIPLE", str(require_multiple)))
+    # If bias-splitting is enabled, bias layers are eligible for preshuffle because
+    # they will call aiter GEMM with bias=None.
+    split_bias = os.environ.get("OPENPI_AITER_SPLIT_BIAS", "0") == "1"
     for module in model.modules():
         if not isinstance(module, nn.Linear):
             continue
-        if module.bias is not None:
+        if module.bias is not None and not split_bias:
             continue
         w = module.weight
         if w.dtype != torch.bfloat16:

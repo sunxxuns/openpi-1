@@ -570,12 +570,12 @@ class GemmaAttention(nn.Module):
         # Select attention implementation: aiter (if enabled) > config-specified > eager
         if get_use_aiter_attention():
             attention_interface: Callable = aiter_attention_forward
-            # ROCm note: compiling through flash-attn can trigger inductor issues for
-            # some q_len!=k_len (KV-cache) cases. By default, keep aiter attention
-            # outside torch.compile (graph break), while still allowing CUDAGraph
-            # capture/replay to remove Python/launch overhead.
+            # ROCm note: historically, compiling through flash-attn could trigger
+            # Inductor issues for some attention cases. With the direct `mha_fwd`
+            # call path and `OPENPI_INDUCTOR_MEMORY_PLANNING=0`, this is now stable
+            # for the OpenPI policy benchmark and significantly reduces kernel count.
             try:
-                if os.environ.get("OPENPI_DISABLE_COMPILE_AITER_ATTN", "1") == "1":
+                if os.environ.get("OPENPI_DISABLE_COMPILE_AITER_ATTN", "0") == "1":
                     import torch._dynamo as _dynamo  # type: ignore
 
                     attention_interface = _dynamo.disable(attention_interface)

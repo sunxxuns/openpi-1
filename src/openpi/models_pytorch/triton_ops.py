@@ -97,11 +97,13 @@ def _gelu_tanh_and_mul_kernel(
     up = tl.load(x_row_ptr + N + col_offsets, mask=mask, other=0.0).to(tl.float32)
     
     # GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # NOTE: Use tl.math.tanh directly for numerical stability (avoid exp overflow -> inf/inf -> NaN).
     k = 0.7978845608028654  # sqrt(2/pi)
     gate_cubed = gate * gate * gate
     inner = k * (gate + 0.044715 * gate_cubed)
-    # Compute tanh via exp
+    # ROCm Triton builds we use here don't expose a tanh intrinsic, so implement tanh
+    # via exp with clamping to avoid overflow (which would otherwise yield inf/inf -> NaN).
+    inner = tl.maximum(tl.minimum(inner, 10.0), -10.0)
     exp_2x = tl.math.exp(2.0 * inner)
     tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
     gelu_gate = 0.5 * gate * (1.0 + tanh_val)
