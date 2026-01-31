@@ -35,7 +35,7 @@ os.environ.setdefault("OPENPI_DISABLE_COMPILE_AITER_ATTN", "0")
 os.environ.setdefault("OPENPI_AITER_ATTN_DIRECT_MHA", "1")
 os.environ.setdefault("AUTO_PATCH_TRANSFORMERS", "1")
 os.environ.setdefault("OPENPI_MANUAL_CUDAGRAPH", "0")  # capture+replay full sample_actions (best effort)
-os.environ.setdefault("AITER_PRESHUFFLE_WEIGHTS", "0")  # enable bpreshuffle for eligible Linear weights
+os.environ.setdefault("AITER_PRESHUFFLE_WEIGHTS", "1")  # enable bpreshuffle for eligible Linear weights
 os.environ.setdefault("OPENPI_NUMERIC_CHECK", "0")  # compare call vs graph replay numerics
 os.environ.setdefault("OPENPI_PROFILE_SHAPES", "0")  # print op tables grouped by input shapes
 
