@@ -119,6 +119,10 @@ def main():
         pi05: bool = False
     
     config = Pi0ConfigPytorch()
+    # Allow e2e benchmarking of different predicted token counts (action horizon).
+    # Example: OPENPI_ACTION_HORIZON=15 for "1 + 15 action tokens" style tests.
+    config.action_horizon = int(os.environ.get("OPENPI_ACTION_HORIZON", str(config.action_horizon)))
+    print(f"[openpi] action_horizon={config.action_horizon}", flush=True)
     
     model = PI0Pytorch(config)
     model = model.to(device)

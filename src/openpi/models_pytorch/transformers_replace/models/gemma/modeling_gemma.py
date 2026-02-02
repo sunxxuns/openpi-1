@@ -455,6 +455,8 @@ def aiter_attention_forward(
     attn_output = None
     if use_direct_mha:
         try:
+            # Prefer calling the underlying compiled op directly (more torch.compile friendly).
+            # aiter's `mha_fwd` signature includes `sink_size` in newer versions; pass it as 0.
             from aiter.ops.mha import mha_fwd  # type: ignore
 
             outs = mha_fwd(
@@ -464,8 +466,9 @@ def aiter_attention_forward(
                 dropout if module.training else 0.0,
                 float(scaling),
                 bool(use_causal),
-                -1,
-                -1,
+                -1,  # window_size_left
+                -1,  # window_size_right
+                0,   # sink_size (disabled)
                 False,  # return_softmax_lse
                 False,  # return_dropout_randval
             )
