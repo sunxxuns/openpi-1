@@ -22,10 +22,33 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if _SRC_ROOT.exists():
     sys.path.insert(0, str(_SRC_ROOT))
 
+import argparse
 import time
 import numpy as np
 import torch
 from torch.profiler import profile, ProfilerActivity
+
+
+def parse_args():
+    """Parse command-line arguments (env vars used as fallback defaults)."""
+    p = argparse.ArgumentParser(description="Benchmark Pi0 policy inference")
+    p.add_argument("--gpu", type=int, default=int(os.environ.get("OPENPI_GPU_ID", "7")),
+                    help="GPU device id (default: OPENPI_GPU_ID or 7)")
+    p.add_argument("--batch-size", type=int, default=int(os.environ.get("OPENPI_BATCH_SIZE", "1")),
+                    help="Batch size (default: 1)")
+    p.add_argument("--warmup", type=int, default=int(os.environ.get("WARMUP", "10")),
+                    help="Warmup iterations (default: 10)")
+    p.add_argument("--iterations", type=int, default=int(os.environ.get("ITERATIONS", "30")),
+                    help="Benchmark iterations (default: 30)")
+    p.add_argument("--num-steps", type=int, default=int(os.environ.get("NUM_STEPS", "10")),
+                    help="Denoising steps (default: 10)")
+    p.add_argument("--timing", choices=["wall", "cuda_event"], default=os.environ.get("OPENPI_TIMING", "wall"),
+                    help="Timing method: wall or cuda_event (default: wall)")
+    p.add_argument("--profile", action="store_true", default=os.environ.get("PROFILE", "0") == "1",
+                    help="Enable profiling (default: PROFILE env or off)")
+    p.add_argument("--profile-dir", default=os.environ.get("PROFILE_DIR", "traces"),
+                    help="Directory for profile traces (default: traces)")
+    return p.parse_args()
 
 # Enable optimizations by default (can be overridden via env)
 os.environ.setdefault("USE_AITER_ATTENTION", "1")
@@ -120,6 +143,8 @@ set_use_aiter_attention(True)
 
 
 def main():
+    args = parse_args()
+
     # Guard rails: these two env vars are the most common reason we "forget" the 31ms path.
     # Don't hard-fail (people may be experimenting), but print a loud warning.
     if os.environ.get("OPENPI_DISABLE_COMPILE_AITER_ATTN", "0") == "1":
@@ -136,18 +161,11 @@ def main():
         )
 
     print("=" * 70)
-    print("PI0 FULL POLICY INFERENCE BENCHMARK - AMD MI350")
+    print("PI0 FULL POLICY INFERENCE BENCHMARK")
     print("=" * 70)
     
-    # Default to GPU 7 on multi-GPU MI350 boxes to avoid clobbering other jobs.
-    # Override via OPENPI_GPU_ID (preferred) or OPENPI_DEVICE (e.g. "cuda:3").
-    openpi_device = os.environ.get("OPENPI_DEVICE")
-    if openpi_device is not None:
-        device = torch.device(openpi_device)
-        gpu_id = device.index if device.type == "cuda" else 0
-    else:
-        gpu_id = int(os.environ.get("OPENPI_GPU_ID", "7"))
-        device = torch.device(f"cuda:{gpu_id}")
+    gpu_id = args.gpu
+    device = torch.device(f"cuda:{gpu_id}")
 
     if device.type == "cuda":
         torch.cuda.set_device(gpu_id)
@@ -256,8 +274,8 @@ def main():
     print(f"Model parameters: {param_count:.2f}B")
     
     # Create observation
-    print("\nCreating observation (batch_size=1)...")
-    batch_size = 1
+    batch_size = args.batch_size
+    print(f"\nCreating observation (batch_size={batch_size})...")
     
     # Simple observation class for PyTorch benchmark
     class SimpleObservation:
@@ -298,10 +316,10 @@ def main():
         except Exception:
             torch.cuda.synchronize()
     
-    # Benchmark (allow env overrides for faster iterations)
-    num_steps = int(os.environ.get("NUM_STEPS", "10"))
-    warmup = int(os.environ.get("WARMUP", "10"))
-    iterations = int(os.environ.get("ITERATIONS", "30"))
+    # Benchmark parameters
+    num_steps = args.num_steps
+    warmup = args.warmup
+    iterations = args.iterations
     
     print(f"\nDenoising steps: {num_steps}")
     print(f"Warmup: {warmup}, Iterations: {iterations}")
@@ -433,9 +451,9 @@ def main():
                 flush=True,
             )
     
-    # Optional profiling (set PROFILE=1)
-    if os.environ.get("PROFILE", "0") == "1":
-        trace_dir = os.environ.get("PROFILE_DIR", "traces")
+    # Optional profiling
+    if args.profile:
+        trace_dir = args.profile_dir
         os.makedirs(trace_dir, exist_ok=True)
         profile_replay = os.environ.get("PROFILE_GRAPH_REPLAY", "0") == "1"
         profile_shapes = os.environ.get("OPENPI_PROFILE_SHAPES", "0") == "1"
@@ -474,7 +492,7 @@ def main():
                 print(f"(could not group by input shape: {e})")
 
     # Benchmark
-    timing = os.environ.get("OPENPI_TIMING", "wall").lower()  # wall | cuda_event
+    timing = args.timing.lower()
     print(f"Benchmarking... (timing={timing})")
     latencies = []
     latencies_wall = []
@@ -540,7 +558,10 @@ def main():
         print(f"P50 wall:       {np.percentile(latencies_wall, 50):.1f} ms")
         print(f"P95 wall:       {np.percentile(latencies_wall, 95):.1f} ms")
     print(f"Actions shape:  {tuple(actions.shape)}")
-    print(f"Throughput:     {1000/np.mean(latencies):.2f} Hz")
+    hz = 1000 / np.mean(latencies)
+    print(f"Throughput:     {hz:.2f} Hz")
+    if batch_size > 1:
+        print(f"Samples/s:      {hz * batch_size:.2f} ({batch_size} x {hz:.2f} Hz)")
     
     # Memory
     print(f"\n{'='*70}")
