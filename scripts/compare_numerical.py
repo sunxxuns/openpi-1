@@ -17,6 +17,11 @@ import sys
 
 import torch
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if _SRC_ROOT.exists():
+    sys.path.insert(0, str(_SRC_ROOT))
+
 
 def _is_rocm() -> bool:
     return hasattr(torch.version, "hip") and torch.version.hip is not None
