@@ -7,7 +7,13 @@ Covers inference and training across various workload configurations.
 
 import os
 import sys
-sys.path.insert(0, "/sgl-workspace/openpi/src")
+import pathlib
+
+# Make repo `src/` importable when running from a source checkout.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if _SRC_ROOT.exists():
+    sys.path.insert(0, str(_SRC_ROOT))
 
 import json
 import time
@@ -289,7 +295,7 @@ def main():
         "traces": [],
     }
     
-    trace_dir = "/sgl-workspace/openpi/traces"
+    trace_dir = str(_REPO_ROOT / "traces")
     os.makedirs(trace_dir, exist_ok=True)
     
     # Run benchmarks for each model config
@@ -396,7 +402,7 @@ def main():
         torch.cuda.empty_cache()
     
     # Save results
-    results_path = "/sgl-workspace/openpi/benchmark_results_mi350.json"
+    results_path = str(_REPO_ROOT / "benchmark_results_mi350.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {results_path}")

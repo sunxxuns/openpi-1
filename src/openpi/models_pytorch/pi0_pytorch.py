@@ -461,7 +461,9 @@ class PI0Pytorch(nn.Module):
         # tensor while capture is active (would do a forbidden device->host sync).
         # We therefore cache a Python mask-pattern during warmup (outside capture)
         # and reuse it during capture/replay.
-        skip_masked_images = os.environ.get("OPENPI_SKIP_MASKED_IMAGES", "1") == "1"
+        # Default OFF to avoid changing behavior for other workloads/hardware.
+        # Enable explicitly for MI350 policy inference best-known config.
+        skip_masked_images = os.environ.get("OPENPI_SKIP_MASKED_IMAGES", "0") == "1"
         active_pattern = getattr(self, "_openpi_active_img_mask_pattern", None)
         active_key = getattr(self, "_openpi_active_img_mask_key", None)
         if skip_masked_images:

@@ -20,37 +20,32 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Benchmark Results: NVIDIA H200 vs AMD MI350
 
-Comparison benchmark between NVIDIA H200 and AMD MI350 with optimized kernels.
+We track **end-to-end Pi0 policy inference** (3.5B params, batch=1, 10 denoising steps) via
+`scripts/benchmark_policy_inference.py`.
 
-### Pi0 Full Policy Inference (3.5B model, batch=1)
+- **H200 reference (CUDA)**:
+  - See `BENCHMARK_H200.md` and the `h200-benchmark-comparison` branch.
+  - Trace: `traces/h200_inference_compiled.json`
+- **MI350 reference (ROCm)**:
+  - Best-known config + runbook: `MI350_BEST_KNOWN_CONFIG.md` / `MI350_POLICY_INFERENCE_RUNBOOK.md`
 
-| Configuration | Latency | Throughput | Memory |
-|---------------|---------|------------|--------|
-| AMD MI350 (eager) | 137.3 ms | 7.28 Hz | 7.10 GB |
-| NVIDIA H200 (eager) | 120.8 ms | 8.28 Hz | 7.06 GB |
-| **AMD MI350 (torch.compile)** | **35.7 ms** | **28.04 Hz** | 10.03 GB |
-| **NVIDIA H200 (torch.compile)** | **32.9 ms** | **30.44 Hz** | 7.03 GB |
+### Pi0 Full Policy Inference (E2E)
 
-**Result:** With torch.compile, MI350 is only **~8% slower** than H200 (35.7ms vs 32.9ms). Both achieve **~4x speedup** over eager mode.
+| GPU | Configuration | Latency | Throughput |
+|-----|---------------|---------|------------|
+| NVIDIA H200 | torch.compile (bf16) | 32.9 ms | 30.4 Hz |
+| AMD MI350 | torch.compile baseline | 35.7 ms | 28.0 Hz |
+| **AMD MI350** | **best-known** (manual full-call CUDAGraph + SDPA KV-cache + skip fully-masked cameras + tuned GEMMs) | **~22.2 ms** | **~45.0 Hz** |
 
-### 8-GPU DDP Training (3.3B Model)
+Perf/W target (match H200 at ~700W vs MI350 ~1000W): \(700/1000 \times 32.9\text{ms} \approx 23.0\text{ms}\).
+The MI350 best-known config meets this target on the default benchmark (where one camera is fully masked).
 
-| Batch/GPU | Total Batch | Seq | AMD MI350 (Aiter) | NVIDIA H200 (SDPA) |
-|-----------|-------------|-----|-------------------|---------------------|
-| 4 | 32 | 512 | 225 samples/s | 218 samples/s |
-| 8 | 64 | 512 | 329 samples/s | 279 samples/s |
-| 8 | 64 | 1024 | 196 samples/s | 157 samples/s |
-| 16 | 128 | 512 | **407 samples/s** | 320 samples/s |
+Notes:
 
-**Result:** MI350 is ~21-27% faster on training with Aiter+Triton optimizations
-
-### Analysis
-
-- **Inference (torch.compile):** Both platforms achieve ~4x speedup; MI350 is only ~8% slower than H200
-- **Inference (eager):** H200 is ~12% faster due to Hopper tensor cores and HBM3e bandwidth
-- **Training:** MI350's Aiter Flash Attention + Triton kernels are optimized for backward pass operations
-
-For detailed results, trace files, and benchmark scripts, see [BENCHMARK_H200.md](BENCHMARK_H200.md). 
+- `OPENPI_SKIP_MASKED_IMAGES=1` drops image tokens for fully-masked cameras (e.g. 788→532 tokens in the default benchmark),
+  which changes the hot GEMM shapes. The repo includes extra tuned configs in `configs/openpi_bf16_tuned_gemm.csv`, and
+  `scripts/benchmark_policy_inference.py` auto-loads them unless you override `AITER_CONFIG_GEMM_BF16`.
+- Default model behavior (including CUDA/H200 traces) is unchanged unless you explicitly set `OPENPI_SKIP_MASKED_IMAGES=1`.
 
 
 ## Requirements

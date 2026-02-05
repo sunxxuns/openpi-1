@@ -17,10 +17,15 @@ import sys
 import time
 import json
 import argparse
+import pathlib
 from datetime import datetime
 from collections import defaultdict
 
-sys.path.insert(0, "/sgl-workspace/openpi/src")
+# Make repo `src/` importable when running from a source checkout.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if _SRC_ROOT.exists():
+    sys.path.insert(0, str(_SRC_ROOT))
 
 import torch
 from torch.profiler import profile, ProfilerActivity, record_function
@@ -153,7 +158,9 @@ def profile_workload(model_fn, inputs, name, warmup=5, iterations=20, save_trace
     power_before = get_gpu_power()
     
     # Profile with torch profiler
-    trace_file = f"/sgl-workspace/openpi/traces/power_{name.replace(' ', '_').lower()}.json"
+    trace_dir = _REPO_ROOT / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_file = str(trace_dir / f"power_{name.replace(' ', '_').lower()}.json")
     
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -456,7 +463,7 @@ Based on profiling analysis:
 """)
     
     # Save results
-    results_file = "/sgl-workspace/openpi/traces/power_efficiency_results.json"
+    results_file = str((_REPO_ROOT / "traces") / "power_efficiency_results.json")
     with open(results_file, "w") as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),

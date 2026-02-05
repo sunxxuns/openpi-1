@@ -169,3 +169,9 @@ cython_debug/
 
 # Local profiling artifacts (very large)
 traces/
+
+# Crash dumps / core files
+core
+core.*
+*.core
+gpucore.*

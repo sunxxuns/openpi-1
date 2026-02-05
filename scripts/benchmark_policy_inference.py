@@ -15,7 +15,12 @@ import os
 import sys
 import pathlib
 import shutil
-sys.path.insert(0, "/sgl-workspace/openpi/src")
+
+# Make repo `src/` importable when running from a source checkout.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if _SRC_ROOT.exists():
+    sys.path.insert(0, str(_SRC_ROOT))
 
 import time
 import numpy as np
