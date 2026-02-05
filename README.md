@@ -25,24 +25,23 @@ All numbers below are from `scripts/benchmark_policy_inference.py` on MI350 (eve
 | 4c | + fuse SigLIP QKV (3 GEMMs → 1) (`OPENPI_FUSE_SIGLIP_QKV=1`) | 21.4 | 46.69 | -0.7 |
 | 4d | + route fused SigLIP QKV through aiter tuned GEMM (`OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1`) | 21.2 | 47.15 | -0.2 |
 
-## Power Efficiency Analysis
+## Batch size scaling (MI350 @ 700W power cap)
 
-**Important**: Actual measured power during inference is much lower than TDP!
+All optimizations enabled. 10 denoising steps.
 
-| Metric | H200 | MI350 (measured) | MI350 (TDP) |
-|--------|------|------------------|-------------|
-| **Throughput** | 39.45 Hz | 46.30 Hz | 46.30 Hz |
-| **Latency** | 25.35 ms | 21.6 ms | 21.6 ms |
-| **Power** | 700 W | **280 W** | 1000 W |
-| **Efficiency** | 56.4 samples/kJ | **165.7 samples/kJ** | 46.3 samples/kJ |
-| **vs H200** | baseline | **+194%** | -18% |
+| BSZ | Latency (ms) | Hz | Samples/s |
+|-----|-------------|-----|-----------|
+| 1 | 21.5 | 46.6 | 46.6 |
+| 2 | 31.0 | 32.3 | 64.6 |
+| 4 | 44.8 | 22.3 | 89.4 |
+| 8 | 66.5 | 15.1 | 120.4 |
+| 16 | 114.5 | 8.7 | 139.7 |
+| 32 | 214.9 | 4.7 | 148.9 |
+| 64 | 404.3 | 2.5 | 158.3 |
 
-The OpenPI workload (2B params, batch=1) doesn't fully saturate the MI350 GPU. At measured power consumption:
-- **MI350 is nearly 3x more efficient than H200** for this workload
-- Peak power (579W) only occurs during HIP graph compilation/warmup
-- Steady-state inference runs at ~280W average
+Peak throughput: **158 samples/s** at BSZ 64.
 
-### Kernel Fusion Gap (why TDP comparison looks worse)
+## Kernel Fusion Gap
 
 | Category | H200 | MI350 |
 |----------|------|-------|
@@ -53,17 +52,11 @@ The OpenPI workload (2B params, batch=1) doesn't fully saturate the MI350 GPU. A
 
 H200's `torch.compile` generates highly fused Triton kernels that combine GEMM with activation and normalization in single kernels (e.g., `triton_tem_fused__unsafe_view_gelu_mm_mul_t_view`). MI350 uses faster rocBLAS for GEMMs but cannot fuse epilogue operations, resulting in more memory traffic.
 
-### What's Already Optimized on MI350
+## What's Already Optimized on MI350
 
-- ✅ HIP graph replay (100% kernel utilization, lower overhead than H200)
-- ✅ Aiter Flash Attention (1.22x faster than SDPA)
-- ✅ Fused GELU+mul kernel (separate from GEMM)
-- ✅ Tuned rocBLAS GEMM kernels for OpenPI shapes
-- ✅ Masked image skipping
-- ✅ Fused SigLIP QKV projection
-
-### Remaining Optimization Opportunities
-
-1. **Power tuning** (Medium effort): Lower power cap to ~750W may achieve efficiency parity
-2. **Custom fused Triton kernels** (High effort): GEMM+GELU fusion for MI350
-3. **Batching** (User-level): Larger batch sizes improve GPU utilization
+- HIP graph replay (100% kernel utilization, lower overhead than H200)
+- Aiter Flash Attention (1.22x faster than SDPA)
+- Fused GELU+mul kernel (separate from GEMM)
+- Tuned rocBLAS GEMM kernels for OpenPI shapes
+- Masked image skipping
+- Fused SigLIP QKV projection
