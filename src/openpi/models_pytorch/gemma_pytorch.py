@@ -11,6 +11,16 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 from transformers.models.gemma.modeling_gemma import get_use_aiter_attention, aiter_attention_forward
 
+try:
+    # Optional: route fused F.linear GEMMs through aiter tuned GEMM.
+    from openpi.models_pytorch.aiter_ops import get_use_aiter_gemm, aiter_linear
+except Exception:
+    def get_use_aiter_gemm() -> bool:  # type: ignore[override]
+        return False
+
+    def aiter_linear(x, weight, bias=None):  # type: ignore[override]
+        return F.linear(x, weight, bias)
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -178,7 +188,24 @@ class PaliGemmaWithExpertModel(nn.Module):
                     if hasattr(attn, "_use_fused_qkv") and attn._use_fused_qkv and hasattr(attn, "_fused_qkv_weight"):
                         q_size = attn.q_proj.weight.shape[0]
                         k_size = attn.k_proj.weight.shape[0]
-                        qkv_states = F.linear(hidden_states, attn._fused_qkv_weight)
+                        # Optional MI350-only experiment:
+                        # Routing fused GEMMs through aiter can help for *small-M* (decode-ish) shapes,
+                        # but can regress for large M (prefill-ish) shapes. Keep default behavior as F.linear.
+                        route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+                        if route_fused and get_use_aiter_gemm():
+                            try:
+                                # hidden_states is typically [B, S, K]
+                                m = int(hidden_states.shape[0]) * int(hidden_states.shape[1]) if hidden_states.ndim == 3 else int(hidden_states.shape[0])
+                            except Exception:
+                                m = 0
+                            m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                            if m and m <= m_thresh:
+                                fused_w = getattr(attn, "_aiter_preshuffled_fused_qkv_weight", attn._fused_qkv_weight)
+                                qkv_states = aiter_linear(hidden_states, fused_w, bias=None)
+                            else:
+                                qkv_states = F.linear(hidden_states, attn._fused_qkv_weight)
+                        else:
+                            qkv_states = F.linear(hidden_states, attn._fused_qkv_weight)
                         query_state = qkv_states[..., :q_size].view(hidden_shape).transpose(1, 2)
                         key_state = qkv_states[..., q_size:q_size + k_size].view(hidden_shape).transpose(1, 2)
                         value_state = qkv_states[..., q_size + k_size:].view(hidden_shape).transpose(1, 2)
@@ -342,6 +369,20 @@ class PaliGemmaWithExpertModel(nn.Module):
                             attn.register_buffer("_fused_qkv_weight", fused_weight)
                             attn._use_fused_qkv = True
                             qkv_count += 1
+                            # Optional: preshuffle fused QKV weights for aiter asm GEMM paths.
+                            if (
+                                os.environ.get("AITER_PRESHUFFLE_WEIGHTS", "0") == "1"
+                                and os.environ.get("OPENPI_PRESHUFFLE_FUSED_WEIGHTS", "0") == "1"
+                            ):
+                                try:
+                                    from aiter.ops.shuffle import shuffle_weight
+                                    require_multiple = int(os.environ.get("AITER_PRESHUFFLE_REQUIRE_MULTIPLE", "256"))
+                                    n, k = fused_weight.shape
+                                    if (n % require_multiple == 0) and (k % require_multiple == 0):
+                                        w_shuf = shuffle_weight(fused_weight, layout=(16, 16))
+                                        attn.register_buffer("_aiter_preshuffled_fused_qkv_weight", w_shuf)
+                                except Exception:
+                                    pass
 
                 if fuse_gate_up and hasattr(layer, "mlp"):
                     mlp = layer.mlp
@@ -355,6 +396,20 @@ class PaliGemmaWithExpertModel(nn.Module):
                             if gelu_tanh_and_mul is not None:
                                 mlp._gelu_tanh_and_mul = gelu_tanh_and_mul
                             gate_up_count += 1
+                            # Optional: preshuffle fused gate+up weights for aiter asm GEMM paths.
+                            if (
+                                os.environ.get("AITER_PRESHUFFLE_WEIGHTS", "0") == "1"
+                                and os.environ.get("OPENPI_PRESHUFFLE_FUSED_WEIGHTS", "0") == "1"
+                            ):
+                                try:
+                                    from aiter.ops.shuffle import shuffle_weight
+                                    require_multiple = int(os.environ.get("AITER_PRESHUFFLE_REQUIRE_MULTIPLE", "256"))
+                                    n, k = fused_weight.shape
+                                    if (n % require_multiple == 0) and (k % require_multiple == 0):
+                                        w_shuf = shuffle_weight(fused_weight, layout=(16, 16))
+                                        mlp.register_buffer("_aiter_preshuffled_fused_gate_up_weight", w_shuf)
+                                except Exception:
+                                    pass
 
         if verbose:
             print(f"Fused {qkv_count} QKV projections, {gate_up_count} Gate+Up projections")

@@ -294,6 +294,32 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # ---------------------------------------------------------------------
+        # Capture-friendly constant masks (ROCm CUDAGraph/HIP graph)
+        # ---------------------------------------------------------------------
+        # Creating small tensors from Python lists on-device (e.g. torch.tensor([..], device="cuda"))
+        # can fail under ROCm stream capture (hipErrorStreamCaptureUnsupported). Keep the suffix
+        # pad/attention masks as module buffers so they're already resident on-device.
+        try:
+            suffix_len = int(self.config.action_horizon) + (0 if self.pi05 else 1)
+        except Exception:
+            suffix_len = 0
+        if suffix_len > 0:
+            # Pad mask is always all-ones for the suffix (state + action tokens).
+            self.register_buffer(
+                "_openpi_suffix_pad_mask_1x",
+                torch.ones(1, suffix_len, dtype=torch.bool),
+                persistent=False,
+            )
+            # mask_ar / att_masks pattern used by make_att_2d_masks:
+            # - pi0: state token starts a new block, action[0] starts a new block, rest share the block.
+            # - pi0.5: first action token starts a new block, rest share the block.
+            att_1d = torch.zeros(suffix_len, dtype=torch.bool)
+            att_1d[0] = True
+            if (not self.pi05) and suffix_len > 1:
+                att_1d[1] = True
+            self.register_buffer("_openpi_suffix_att_mask_1d", att_1d, persistent=False)
+
         _maybe_enable_inductor_compile_logging()
         torch.set_float32_matmul_precision("high")
         
@@ -328,7 +354,16 @@ class PI0Pytorch(nn.Module):
         is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
         if is_rocm:
             print(f"[torch.compile] ROCm detected, mode={compile_mode}", flush=True)
-        if compile_mode != "disable":
+        # Profiling-only mode: split sample_actions into multiple compiled subgraphs
+        # so Perfetto shows prefill / "something" / 10-step decode separately (H200-style).
+        profile_split = os.environ.get("OPENPI_PROFILE_SPLIT_GRAPHS", "0") == "1"
+        if profile_split:
+            print(
+                "[torch.compile] OPENPI_PROFILE_SPLIT_GRAPHS=1 -> keep sample_actions eager; "
+                "compile stages separately for trace segmentation",
+                flush=True,
+            )
+        elif compile_mode != "disable":
             self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
 
         # Initialize gradient checkpointing flag
@@ -414,10 +449,68 @@ class PI0Pytorch(nn.Module):
         """
         embs = []
         pad_masks = []
-        att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # Process images.
+        #
+        # Perf: if an image is fully masked out for the whole batch, we can skip
+        # running the (expensive) vision tower entirely and also drop its tokens.
+        # This is a BIG win for the default OpenPI policy benchmark where
+        # `right_wrist_0_rgb` is often absent (mask=0).
+        #
+        # Important for CUDAGraph capture on ROCm: never call `.item()` on a CUDA
+        # tensor while capture is active (would do a forbidden device->host sync).
+        # We therefore cache a Python mask-pattern during warmup (outside capture)
+        # and reuse it during capture/replay.
+        skip_masked_images = os.environ.get("OPENPI_SKIP_MASKED_IMAGES", "1") == "1"
+        active_pattern = getattr(self, "_openpi_active_img_mask_pattern", None)
+        active_key = getattr(self, "_openpi_active_img_mask_key", None)
+        if skip_masked_images:
+            # Best-effort: refresh the pattern when *not* capturing.
+            capturing = False
+            try:
+                capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                capturing = False
+
+            # Create a cheap key so we only recompute when masks change.
+            # (Calling `.item()` would synchronize; do that only outside capture.)
+            cur_key = None
+            try:
+                cur_key = tuple(
+                    (int(m.data_ptr()), tuple(m.shape), str(m.device)) for m in img_masks
+                )
+            except Exception:
+                cur_key = None
+
+            if not capturing and (
+                active_pattern is None
+                or len(active_pattern) != len(images)
+                or (cur_key is not None and active_key != cur_key)
+            ):
+                try:
+                    active_pattern = tuple(bool(m.any().item()) for m in img_masks)
+                    active_key = cur_key
+                    setattr(self, "_openpi_active_img_mask_pattern", active_pattern)
+                    setattr(self, "_openpi_active_img_mask_key", active_key)
+                except Exception:
+                    active_pattern = None
+                    active_key = None
+
+            # During capture, if we couldn't precompute the pattern, fall back to
+            # "process everything" for safety.
+            if capturing and (
+                active_pattern is None
+                or len(active_pattern) != len(images)
+                or (cur_key is not None and active_key != cur_key)
+            ):
+                active_pattern = tuple(True for _ in images)
+
+        if active_pattern is None or len(active_pattern) != len(images):
+            active_pattern = tuple(True for _ in images)
+
+        for img, img_mask, is_active in zip(images, img_masks, active_pattern, strict=True):
+            if skip_masked_images and not is_active:
+                continue
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
@@ -428,9 +521,6 @@ class PI0Pytorch(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -443,25 +533,17 @@ class PI0Pytorch(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
-        bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        # Prefix is full-bidirectional (no autoregressive blocking); att_masks is all zeros.
+        # Construct on-device (avoid host->device tensor creation during stream capture).
+        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)
 
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
-        pad_masks = []
-        att_masks = []
 
         if not self.pi05:
             if self.state_proj.weight.dtype == torch.float32:
@@ -474,14 +556,6 @@ class PI0Pytorch(nn.Module):
             state_emb = self._apply_checkpoint(state_proj_func, state)
 
             embs.append(state_emb[:, None, :])
-            bsize = state_emb.shape[0]
-            device = state_emb.device
-
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-            pad_masks.append(state_mask)
-
-            # Set attention masks so that image and language inputs do not attend to state or actions
-            att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -522,18 +596,13 @@ class PI0Pytorch(nn.Module):
         # Add to input tokens
         embs.append(action_time_emb)
 
-        bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-        pad_masks.append(action_time_mask)
-
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
-
         embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
+        bsize = noisy_actions.shape[0]
+        # NOTE: These are small, constant buffers registered in __init__ and moved with the model.
+        # Using them avoids forbidden host->device tensor creation during ROCm stream capture, and
+        # keeps the function torch.compile friendly (no Python-side branching).
+        pad_masks = self._openpi_suffix_pad_mask_1x.expand(bsize, -1)  # type: ignore[attr-defined]
+        att_masks = self._openpi_suffix_att_mask_1d[None, :].expand(bsize, -1)  # type: ignore[attr-defined]
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
@@ -598,6 +667,17 @@ class PI0Pytorch(nn.Module):
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        # Profiling-only path: emit 3 distinct compiled graphs like H200:
+        # 1) prefix embed (\"prefill\"), 2) prefix KV cache build (\"something\"),
+        # 3) decode/denoise step (called num_steps times).
+        if os.environ.get("OPENPI_PROFILE_SPLIT_GRAPHS", "0") == "1":
+            return self._sample_actions_profile_split(
+                device=device,
+                observation=observation,
+                noise=noise,
+                num_steps=num_steps,
+            )
+
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -652,6 +732,125 @@ class PI0Pytorch(nn.Module):
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + (dt * v_t)
+        return x_t
+
+    @torch.no_grad()
+    def _sample_actions_profile_split(self, device, observation, noise=None, num_steps=10) -> Tensor:
+        """Profiling-only: split sample_actions into multiple compiled subgraphs.
+
+        This intentionally changes compilation structure for better trace segmentation.
+        It should NOT be used for latency benchmarking.
+        """
+        # Local import to avoid any overhead in the hot path unless enabled.
+        from torch.profiler import record_function
+
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        # Use a stable compile mode for split graphs (default matches main path).
+        is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+        default_mode = "default" if is_rocm else "reduce-overhead"
+        split_mode = os.environ.get("OPENPI_PROFILE_SPLIT_COMPILE_MODE", default_mode)
+
+        # ---------------------------
+        # Stage 0: preprocess (eager)
+        # ---------------------------
+        with record_function("openpi/preprocess_observation"):
+            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+                observation, train=False
+            )
+            # torch.compile handles tuples more predictably than Python lists.
+            images_t = tuple(images)
+            img_masks_t = tuple(img_masks)
+
+        # ---------------------------------------------------
+        # Stage 1: prefix embed ("prefill") (compiled function)
+        # ---------------------------------------------------
+        if not hasattr(self, "_openpi_profile_embed_prefix_compiled"):
+            # Compile once and cache.
+            def _embed_prefix(images, img_masks, lang_tokens, lang_masks):
+                return self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+
+            self._openpi_profile_embed_prefix_compiled = torch.compile(  # type: ignore[attr-defined]
+                _embed_prefix,
+                mode=split_mode,
+            )
+
+        with record_function("openpi/prefix_embed_prefill"):
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self._openpi_profile_embed_prefix_compiled(  # type: ignore[attr-defined]
+                images_t, img_masks_t, lang_tokens, lang_masks
+            )
+
+        # ----------------------------------------------------------------
+        # Stage 2: prefix KV-cache build ("something") (compiled function)
+        # ----------------------------------------------------------------
+        if not hasattr(self, "_openpi_profile_prefix_kv_cache_compiled"):
+            def _prefix_kv_cache(prefix_embs, prefix_pad_masks, prefix_att_masks):
+                prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+                prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+                prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+                # Keep attention impl stable for prefix.
+                self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+                _, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks_4d,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    use_cache=True,
+                )
+                return past_key_values
+
+            self._openpi_profile_prefix_kv_cache_compiled = torch.compile(  # type: ignore[attr-defined]
+                _prefix_kv_cache,
+                mode=split_mode,
+            )
+
+        with record_function("openpi/prefix_kv_cache_build"):
+            past_key_values = self._openpi_profile_prefix_kv_cache_compiled(  # type: ignore[attr-defined]
+                prefix_embs, prefix_pad_masks, prefix_att_masks
+            )
+
+        # --------------------------------------------------------
+        # Stage 3: denoise/decode step (compiled, called N times)
+        # --------------------------------------------------------
+        dt = -1.0 / float(num_steps)
+
+        # CUDAGraph-capture friendly timestep schedule (also avoids per-iter allocs).
+        times_key = (str(device), int(num_steps))
+        times = getattr(self, "_openpi_sample_actions_times", None)
+        if not isinstance(times, dict) or times.get("key") != times_key:
+            t0 = 1.0
+            t = torch.arange(num_steps, device=device, dtype=torch.float32) * float(dt) + float(t0)
+            times = {"key": times_key, "t": t}
+            setattr(self, "_openpi_sample_actions_times", times)
+        t_schedule = times["t"]
+
+        if not hasattr(self, "_openpi_profile_denoise_step_compiled"):
+            def _one_step(x_t, timestep, state, prefix_pad_masks, past_key_values):
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    timestep,
+                )
+                return x_t + (float(dt) * v_t)
+
+            self._openpi_profile_denoise_step_compiled = torch.compile(  # type: ignore[attr-defined]
+                _one_step,
+                mode=split_mode,
+            )
+
+        x_t = noise
+        with record_function("openpi/denoise_decode_loop"):
+            for step in range(num_steps):
+                with record_function("openpi/denoise_step"):
+                    timestep = t_schedule[step].expand(bsize)
+                    x_t = self._openpi_profile_denoise_step_compiled(  # type: ignore[attr-defined]
+                        x_t, timestep, state, prefix_pad_masks, past_key_values
+                    )
         return x_t
 
     def denoise_step(

@@ -40,6 +40,55 @@ os.environ.setdefault("OPENPI_NUMERIC_CHECK", "0")  # compare call vs graph repl
 os.environ.setdefault("OPENPI_PROFILE_SHAPES", "0")  # print op tables grouped by input shapes
 
 
+def _maybe_extend_aiter_bf16_tuned_gemm_configs() -> None:
+    """Best-effort: add OpenPI's extra aiter GEMM tuned configs.
+
+    OpenPI sometimes changes effective sequence length (e.g. skipping fully-masked
+    cameras), which changes the hot GEMM shapes. We ship additional tuned configs
+    in-repo so new machines can reproduce best-known performance without needing
+    to modify the aiter installation.
+    """
+    # Respect user overrides.
+    if os.environ.get("AITER_CONFIG_GEMM_BF16"):
+        return
+
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    local_cfg = repo_root / "configs" / "openpi_bf16_tuned_gemm.csv"
+    if not local_cfg.exists():
+        return
+
+    # Find aiter's installed package directory without importing it.
+    aiter_pkg = None
+    try:
+        import importlib.util as _importlib_util
+
+        spec = _importlib_util.find_spec("aiter")
+        if spec is not None and spec.submodule_search_locations:
+            aiter_pkg = pathlib.Path(list(spec.submodule_search_locations)[0])
+    except Exception:
+        aiter_pkg = None
+
+    # If we can't locate aiter, at least expose the local config via env var.
+    if aiter_pkg is None:
+        os.environ["AITER_CONFIG_GEMM_BF16"] = str(local_cfg)
+        return
+
+    default_cfg = aiter_pkg / "configs" / "bf16_tuned_gemm.csv"
+    model_cfg_dir = aiter_pkg / "configs" / "model_configs"
+
+    paths: list[str] = []
+    if default_cfg.exists():
+        paths.append(str(default_cfg))
+    if model_cfg_dir.is_dir():
+        for p in sorted(model_cfg_dir.glob("*bf16_tuned_gemm*.csv")):
+            if "untuned" in p.name:
+                continue
+            paths.append(str(p))
+    paths.append(str(local_cfg))
+
+    os.environ["AITER_CONFIG_GEMM_BF16"] = os.pathsep.join(paths)
+
+
 def _maybe_patch_transformers():
     """Copy local transformers replacements into site-packages if enabled."""
     if os.environ.get("AUTO_PATCH_TRANSFORMERS", "0") != "1":
@@ -59,6 +108,7 @@ def _maybe_patch_transformers():
         print(f"Warning: could not patch transformers models: {exc}")
 
 
+_maybe_extend_aiter_bf16_tuned_gemm_configs()
 _maybe_patch_transformers()
 from transformers.models.gemma.modeling_gemma import set_use_aiter_attention
 set_use_aiter_attention(True)
@@ -160,7 +210,18 @@ def main():
     # Skip expensive mask checks in aiter attention (benchmark-only)
     if os.environ.get("AITER_MASK_OVERRIDE", "0") == "1":
         try:
-            expert_mask_type = os.environ.get("AITER_EXPERT_MASK_TYPE", "eager")
+            # Valid overrides understood by our Gemma aiter attention wrapper:
+            # - "full":   full bidirectional (drops attention_mask, non-causal)
+            # - "causal": causal-with-cache friendly (drops attention_mask, causal)
+            # - "eager":  force eager fallback (keeps attention_mask, correctness-first)
+            expert_mask_type = os.environ.get("AITER_EXPERT_MASK_TYPE", "eager").strip().lower()
+            if expert_mask_type not in ("eager", "full", "causal"):
+                print(
+                    f"[openpi][WARNING] Unknown AITER_EXPERT_MASK_TYPE={expert_mask_type!r}; "
+                    "expected one of: eager|full|causal. Falling back to 'eager'.",
+                    flush=True,
+                )
+                expert_mask_type = "eager"
             for layer in model.paligemma_with_expert.paligemma.language_model.layers:
                 layer.self_attn._aiter_mask_type = "full"  # full bidirectional
             for layer in model.paligemma_with_expert.gemma_expert.model.layers:

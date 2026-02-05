@@ -32,12 +32,15 @@ The main target workload in this repo is:
 
 ### Current best result on MI350 (this repo)
 
-- **~31.2 ms mean latency** using:
+- **~22.2 ms mean latency** using (default benchmark with at least one fully-masked camera):
   - `TORCH_COMPILE_MODE=default`
   - `OPENPI_MANUAL_CUDAGRAPH=1` (manual full-call capture+replay)
-  - `AITER_PRESHUFFLE_WEIGHTS=1` (pre-shuffle eligible Linear weights for bpreshuffle asm GEMM)
+  - `OPENPI_SKIP_MASKED_IMAGES=1` (skip fully-masked cameras; drops their image tokens)
+  - `OPENPI_EAGER_ATTN_USE_SDPA=1` (use SDPA efficient attention kernels for KV-cache case)
+  - `OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1` + `OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000` (ensure fused projections use tuned GEMMs)
+  - `AITER_PRESHUFFLE_WEIGHTS=0` (global bpreshuffle off; avoids regressions for small-M GEMMs)
   - `OPENPI_DISABLE_COMPILE_AITER_ATTN=0` (compile through aiter attention; avoids graph-break kernel bloat)
-  - `OPENPI_AITER_ATTN_DIRECT_MHA=1` (use `aiter.ops.mha.mha_fwd` fast path)
+  - `OPENPI_AITER_ATTN_DIRECT_MHA=1` (use direct `torch.ops.aiter.mha_fwd` fast path)
   - `OPENPI_INDUCTOR_MEMORY_PLANNING=0` (ROCm stability + better kernel graph)
 
 Runbook: see `MI350_POLICY_INFERENCE_RUNBOOK.md`.
@@ -80,7 +83,8 @@ skips CUDA RNG preservation only while the stream is capturing.
 - Root cause: HIP runtime overhead outweighs launch savings
 
 For the full policy benchmark, **manual full-call CUDAGraph replay** helps modestly (and is stable once capture succeeds),
-but it is not sufficient to reach 23ms without additional compute-side gains.
+but hitting the 23ms perf/W target required also reducing compute (e.g. `OPENPI_SKIP_MASKED_IMAGES=1`) and tuning the
+resulting hot GEMM shapes (e.g. \(M=532\)).
 
 ## Recommended Configuration
 

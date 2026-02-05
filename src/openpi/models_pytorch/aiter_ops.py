@@ -457,17 +457,40 @@ def patch_linear_forward():
     if not AITER_GEMM_AVAILABLE:
         print("Warning: aiter GEMM not available, skipping patch")
         return
+
+    # If a preshuffled weight is present, it often helps for large-M GEMMs but can
+    # *hurt* tiny-M (decode-ish) shapes because bpreshuffle forces asm kernels.
+    #
+    # Use preshuffled weights only when M >= threshold (rows in the flattened
+    # [*, K] -> [M, K] view). Set to 0 to always use preshuffled weights (legacy),
+    # or a large value to effectively disable preshuffle at runtime.
+    try:
+        preshuffle_m_thresh = int(os.environ.get("OPENPI_AITER_PRESHUFFLE_M_THRESH", "128"))
+    except Exception:
+        preshuffle_m_thresh = 128
     
     original_forward = nn.Linear.forward
     
     def patched_forward(self, x):
         if get_use_aiter_gemm():
-            w = getattr(self, "_aiter_preshuffled_weight", self.weight)
+            w = self.weight
+            w_shuf = getattr(self, "_aiter_preshuffled_weight", None)
+            if w_shuf is not None and preshuffle_m_thresh >= 0:
+                # M = total rows when flattening all leading dims.
+                try:
+                    m = int(x.numel() // x.shape[-1])
+                except Exception:
+                    m = 0
+                if preshuffle_m_thresh == 0 or (m and m >= preshuffle_m_thresh):
+                    w = w_shuf
             return aiter_linear(x, w, self.bias)
         return original_forward(self, x)
     
     nn.Linear.forward = patched_forward
-    print("Patched nn.Linear.forward to use aiter GEMM (toggle with set_use_aiter_gemm)")
+    print(
+        "Patched nn.Linear.forward to use aiter GEMM "
+        f"(preshuffle_m_thresh={preshuffle_m_thresh}; toggle with set_use_aiter_gemm)"
+    )
 
 
 def preshuffle_linear_weights_for_aiter(

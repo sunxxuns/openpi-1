@@ -48,6 +48,16 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+try:
+    # Optional: route fused F.linear GEMMs through aiter tuned GEMM (MI350).
+    from openpi.models_pytorch.aiter_ops import get_use_aiter_gemm, aiter_linear
+except Exception:
+    def get_use_aiter_gemm() -> bool:  # type: ignore[override]
+        return False
+
+    def aiter_linear(x, weight, bias=None):  # type: ignore[override]
+        return F.linear(x, weight, bias)
+
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -154,7 +164,22 @@ class GemmaMLP(nn.Module):
     def forward(self, x):
         # Fused path: single GEMM for gate+up (reduces 2 GEMMs to 1)
         if hasattr(self, "_use_fused") and self._use_fused and hasattr(self, "_fused_gate_up_weight"):
-            gate_up = F.linear(x, self._fused_gate_up_weight)
+            # Optional MI350 experiment: see OPENPI_ROUTE_FUSED_LINEAR_TO_AITER.
+            # Default remains F.linear (best-known stable performance).
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(x.shape[0]) * int(x.shape[1]) if x.ndim == 3 else int(x.shape[0])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_gate_up_weight", self._fused_gate_up_weight)
+                    gate_up = aiter_linear(x, fused_w, bias=None)
+                else:
+                    gate_up = F.linear(x, self._fused_gate_up_weight)
+            else:
+                gate_up = F.linear(x, self._fused_gate_up_weight)
             if hasattr(self, "_gelu_tanh_and_mul"):
                 hidden = self._gelu_tanh_and_mul(gate_up)
             else:
@@ -281,6 +306,31 @@ def eager_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # Optional fast-path for KV-cache causal attention on ROCm:
+    # For q_len != k_len, the attention mask we build for "prefix-lm" style decode is
+    # often equivalent to PyTorch SDPA's causal-with-cache semantics (bottom-right aligned).
+    # When enabled, we try SDPA with `is_causal=True` and no explicit mask, which can
+    # unlock flash-attention kernels and avoid explicit bmm+softmax+bmm.
+    if (
+        os.environ.get("OPENPI_EAGER_ATTN_USE_SDPA", "0") == "1"
+        and attention_mask is not None
+        and query.shape[2] != key_states.shape[2]
+        and dropout == 0.0
+    ):
+        try:
+            sdpa_out = F.scaled_dot_product_attention(
+                query,
+                key_states,
+                value_states,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True,
+            )
+            return sdpa_out.transpose(1, 2).contiguous(), None
+        except Exception:
+            # Conservative fallback to the explicit eager attention below.
+            pass
+
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -377,10 +427,12 @@ def aiter_attention_forward(
         # Explicit override wins (also enables q_len != k_len).
         can_use_flash = True
         use_causal = mask_override == "causal"
-        # For q_len != k_len, we do not attempt to validate arbitrary masks.
         # Caller is responsible for only using this override when the effective
-        # mask is compatible with full attention (full) or causal-with-cache (causal).
-        if q_len != k_len and attention_mask is not None:
+        # mask is compatible with full attention ("full") or pure causal ("causal").
+        #
+        # In override mode, the explicit attention mask is unnecessary (and can be
+        # expensive to build / validate), so drop it unconditionally.
+        if attention_mask is not None:
             attention_mask = None
     elif attention_mask is None:
         # No mask = full bidirectional, can use flash
@@ -426,17 +478,39 @@ def aiter_attention_forward(
             module, query, key, value, attention_mask, scaling, dropout, **kwargs
         )
     
-    # Expand KV heads if needed (GQA support)
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    # NOTE: aiter flash-attn supports MQA/GQA natively (K/V can have fewer heads than Q),
+    # so avoid expand-based `repeat_kv` here. Besides saving work, `repeat_kv` produces
+    # expanded/overlapping views that are problematic for torch.compile and can force
+    # expensive `.contiguous()` copies in the KV-cache case.
+    key_states_h = key
+    value_states_h = value
     
     # Transpose to [batch, seq_len, num_heads, head_dim].
     # Important: do NOT force `.contiguous()` here. The last-dimension remains contiguous
     # after this transpose (stride(-1) == 1), and forcing contiguous causes extra copies
     # that show up as standalone to_copy / rope-related kernels in the replay trace.
     query_states = query.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
+    key_states = key_states_h.transpose(1, 2)
+    value_states = value_states_h.transpose(1, 2)
+
+    # NOTE: Some aiter entrypoints (notably `torch.ops.aiter.mha_fwd`) reject tensors with
+    # zero-stride dimensions produced by expand-based GQA/KV repetition, especially when
+    # q_len != k_len (KV-cache case). In that case, we pay the copy once to make K/V
+    # contiguous so we can still use the fast attention kernel.
+    def _needs_contig(x: torch.Tensor) -> bool:
+        try:
+            # We only force contiguity when there are *zero-stride* dims (expand-based views).
+            # Transposed tensors are non-contiguous but usually fine for the aiter op.
+            return any(int(s) == 0 for s in x.stride())
+        except Exception:
+            return True
+
+    # For KV-cache shapes (q_len != k_len), make Q/K/V contiguous if needed.
+    # This avoids aiter runtime/binding issues with expanded/zero-stride tensors.
+    if q_len != k_len and (_needs_contig(query_states) or _needs_contig(key_states) or _needs_contig(value_states)):
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
     
     # Use aiter's flash attention
     if _debug and not _is_compiling:
@@ -453,16 +527,18 @@ def aiter_attention_forward(
     # (padding, branching, returning LSE) during tracing/compilation.
     use_direct_mha = os.environ.get("OPENPI_AITER_ATTN_DIRECT_MHA", "1") == "1"
     attn_output = None
-    if use_direct_mha:
-        try:
-            # Prefer calling the underlying compiled op directly (more torch.compile friendly).
-            # aiter's `mha_fwd` signature includes `sink_size` in newer versions; pass it as 0.
-            from aiter.ops.mha import mha_fwd  # type: ignore
 
-            outs = mha_fwd(
-                query_states,
-                key_states,
-                value_states,
+    def _call_mha_fwd(q, k, v):
+        # Call the underlying torch op directly (most torch.compile friendly).
+        # aiter's `mha_fwd` schema differs across versions (some include `sink_size`).
+        op = torch.ops.aiter.mha_fwd.default  # type: ignore[attr-defined]
+        schema = str(getattr(op, "_schema", ""))
+        has_sink_size = "sink_size" in schema
+        if has_sink_size:
+            outs = op(
+                q,
+                k,
+                v,
                 dropout if module.training else 0.0,
                 float(scaling),
                 bool(use_causal),
@@ -472,22 +548,60 @@ def aiter_attention_forward(
                 False,  # return_softmax_lse
                 False,  # return_dropout_randval
             )
-            # aiter mha_fwd returns [out, lse, p, rng_state]
-            attn_output = outs[0]
+        else:
+            outs = op(
+                q,
+                k,
+                v,
+                dropout if module.training else 0.0,
+                float(scaling),
+                bool(use_causal),
+                -1,  # window_size_left
+                -1,  # window_size_right
+                False,  # return_softmax_lse
+                False,  # return_dropout_randval
+            )
+        # aiter mha_fwd returns [out, lse, p, rng_state]
+        return outs[0]
+
+    if use_direct_mha:
+        # First try: keep tensors as-is (avoids extra copies).
+        try:
+            attn_output = _call_mha_fwd(query_states, key_states, value_states)
         except Exception:
             attn_output = None
 
+        # Retry with contiguous Q/K/V if needed. Some aiter builds reject transposed
+        # or expanded tensors even when the last dimension is contiguous.
+        if attn_output is None:
+            try:
+                attn_output = _call_mha_fwd(
+                    query_states.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                )
+            except Exception:
+                attn_output = None
+
+    # Final fallback: use PyTorch SDPA (keeps correctness, avoids aiter wrapper schema mismatch).
+    # NOTE: We intentionally avoid `aiter.flash_attn_func` here because some aiter versions
+    # call into `mha_fwd` with an argument list that doesn't match the installed op schema.
     if attn_output is None:
-        result = aiter.flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            dropout_p=dropout if module.training else 0.0,
-            softmax_scale=scaling,
-            causal=use_causal,
-            return_lse=True,
-        )
-        attn_output = result[0] if isinstance(result, tuple) else result
+        try:
+            sdpa_out = F.scaled_dot_product_attention(
+                query,
+                repeat_kv(key_states_h, module.num_key_value_groups),
+                repeat_kv(value_states_h, module.num_key_value_groups),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=bool(use_causal),
+            )
+            return sdpa_out.transpose(1, 2).contiguous(), None
+        except Exception:
+            return eager_attention_forward(
+                module, query, key, value, attention_mask, scaling, dropout, **kwargs
+            )
+
     return attn_output, None
 
 
@@ -541,7 +655,23 @@ class GemmaAttention(nn.Module):
         if hasattr(self, "_use_fused_qkv") and self._use_fused_qkv and hasattr(self, "_fused_qkv_weight"):
             q_size = self.q_proj.weight.shape[0]
             k_size = self.k_proj.weight.shape[0]
-            qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
+            # Optional MI350 experiment:
+            # Routing fused GEMMs through aiter can help when we have tuned solutions
+            # for the specific (M,N,K) shapes. Keep default as F.linear unless enabled.
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(hidden_states.numel() // hidden_states.shape[-1])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_qkv_weight", self._fused_qkv_weight)
+                    qkv_states = aiter_linear(hidden_states, fused_w, bias=None)
+                else:
+                    qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
+            else:
+                qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
             query_states = qkv_states[..., :q_size].view(hidden_shape).transpose(1, 2)
             key_states = qkv_states[..., q_size:q_size + k_size].view(hidden_shape).transpose(1, 2)
             value_states = qkv_states[..., q_size + k_size:].view(hidden_shape).transpose(1, 2)
@@ -549,7 +679,20 @@ class GemmaAttention(nn.Module):
         elif hasattr(self, "_use_fused_kv") and self._use_fused_kv and hasattr(self, "_fused_kv_weight"):
             query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
             kv_size = self.k_proj.weight.shape[0]
-            kv_states = F.linear(hidden_states, self._fused_kv_weight)
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(hidden_states.numel() // hidden_states.shape[-1])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_kv_weight", self._fused_kv_weight)
+                    kv_states = aiter_linear(hidden_states, fused_w, bias=None)
+                else:
+                    kv_states = F.linear(hidden_states, self._fused_kv_weight)
+            else:
+                kv_states = F.linear(hidden_states, self._fused_kv_weight)
             key_states = kv_states[..., :kv_size].view(hidden_shape).transpose(1, 2)
             value_states = kv_states[..., kv_size:].view(hidden_shape).transpose(1, 2)
         else:
