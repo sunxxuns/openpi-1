@@ -6,11 +6,28 @@ This README intentionally contains **only** the latest benchmark results for the
 
 | GPU | Latency (ms) | Throughput (Hz) | Notes |
 |-----|--------------|-----------------|-------|
-| **NVIDIA H200** | **25.35** | **39.45** | `h200-benchmark-comparison` (`907ce98`) |
-| **AMD MI350** | **21.2** | **47.15** | best-known (default benchmark; `OPENPI_SKIP_MASKED_IMAGES=1`) |
-| **AMD MI350** | **24.8** | **40.29** | best-known **without** skipping masked cameras (`OPENPI_SKIP_MASKED_IMAGES=0`) |
+| **NVIDIA H200** | **25.35** | **39.45** | `h200-benchmark-comparison` |
+| **AMD MI350** | **21.2** | **47.15** | best-known (`OPENPI_SKIP_MASKED_IMAGES=1`) |
+| **AMD MI350** | **24.8** | **40.29** | best-known **without** skipping masked cameras |
 
-## MI350 optimization ladder (same workload)
+## Batch size scaling
+
+All optimizations enabled. 10 denoising steps. MI350 @ 700W power cap.
+
+| BSZ | MI350 Latency (ms) | MI350 Samples/s | H200 Latency (ms) | H200 Samples/s |
+|-----|--------------------:|----------------:|-------------------:|---------------:|
+| 1 | 21.5 | 46.6 | 25.3 | 39.5 |
+| 2 | 31.0 | 64.6 | 34.4 | 58.1 |
+| 4 | 44.8 | 89.4 | 53.4 | 74.9 |
+| 8 | 66.5 | 120.4 | 94.1 | 85.0 |
+| 16 | 114.5 | 139.7 | 175.1 | 91.4 |
+| 32 | 214.9 | 148.9 | 340.5 | 94.0 |
+| **64** | **404.3** | **158.3** | **655.9** | **97.6** |
+| 128 | OOM (kernel fault) | - | 1638.4 | 78.1 |
+
+MI350 peak: **158.3 samples/s** at BSZ 64 (1.62x H200 peak of 97.6)
+
+## MI350 optimization ladder
 
 All numbers below are from `scripts/benchmark_policy_inference.py` on MI350 (event timing).
 
@@ -22,24 +39,8 @@ All numbers below are from `scripts/benchmark_policy_inference.py` on MI350 (eve
 | 3 | + route fused projections to aiter GEMM (`OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1`) | 26.3 | 37.97 | -1.0 |
 | 4a | + skip fully-masked cameras (**no** extra tuned M=532 GEMMs) | 22.4 | 44.60 | -3.9 |
 | 4b | + tuned M=532 GEMMs (`configs/openpi_bf16_tuned_gemm.csv`) | 22.1 | 45.26 | -0.3 |
-| 4c | + fuse SigLIP QKV (3 GEMMs → 1) (`OPENPI_FUSE_SIGLIP_QKV=1`) | 21.4 | 46.69 | -0.7 |
+| 4c | + fuse SigLIP QKV (3 GEMMs -> 1) (`OPENPI_FUSE_SIGLIP_QKV=1`) | 21.4 | 46.69 | -0.7 |
 | 4d | + route fused SigLIP QKV through aiter tuned GEMM (`OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1`) | 21.2 | 47.15 | -0.2 |
-
-## Batch size scaling (MI350 @ 700W power cap)
-
-All optimizations enabled. 10 denoising steps.
-
-| BSZ | Latency (ms) | Hz | Samples/s |
-|-----|-------------|-----|-----------|
-| 1 | 21.5 | 46.6 | 46.6 |
-| 2 | 31.0 | 32.3 | 64.6 |
-| 4 | 44.8 | 22.3 | 89.4 |
-| 8 | 66.5 | 15.1 | 120.4 |
-| 16 | 114.5 | 8.7 | 139.7 |
-| 32 | 214.9 | 4.7 | 148.9 |
-| 64 | 404.3 | 2.5 | 158.3 |
-
-Peak throughput: **158 samples/s** at BSZ 64.
 
 ## Kernel Fusion Gap
 
@@ -50,7 +51,7 @@ Peak throughput: **158 samples/s** at BSZ 64.
 | Separate activation | 1.3% | 5.9% |
 | Separate norm | 2.9% | 8.9% |
 
-H200's `torch.compile` generates highly fused Triton kernels that combine GEMM with activation and normalization in single kernels (e.g., `triton_tem_fused__unsafe_view_gelu_mm_mul_t_view`). MI350 uses faster rocBLAS for GEMMs but cannot fuse epilogue operations, resulting in more memory traffic.
+H200's `torch.compile` generates fused Triton kernels (GEMM+activation+norm in one kernel). MI350 uses faster rocBLAS for GEMMs but cannot fuse epilogue operations.
 
 ## What's Already Optimized on MI350
 
