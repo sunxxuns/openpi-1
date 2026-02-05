@@ -6,7 +6,7 @@ This README intentionally contains **only** the latest benchmark results for the
 
 | GPU | Latency (ms) | Throughput (Hz) | Notes |
 |-----|--------------|-----------------|-------|
-| **NVIDIA H200** | **25.9** | **38.58** | `h200-benchmark-comparison` (`75a1288`) |
+| **NVIDIA H200** | **25.35** | **39.45** | `h200-benchmark-comparison` (`907ce98`) |
 | **AMD MI350** | **21.2** | **47.15** | best-known (default benchmark; `OPENPI_SKIP_MASKED_IMAGES=1`) |
 | **AMD MI350** | **24.8** | **40.29** | best-known **without** skipping masked cameras (`OPENPI_SKIP_MASKED_IMAGES=0`) |
 
