@@ -15,6 +15,7 @@
 """PyTorch Siglip model."""
 
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -378,9 +379,28 @@ class SiglipAttention(nn.Module):
 
         batch_size, seq_length, embed_dim = hidden_states.shape
 
-        queries = self.q_proj(hidden_states)
-        keys = self.k_proj(hidden_states)
-        values = self.v_proj(hidden_states)
+        # Optional fused QKV projection (reduces 3 GEMMs -> 1 GEMM).
+        if getattr(self, "_use_fused_qkv", False) and hasattr(self, "_fused_qkv_weight"):
+            fused_w = getattr(self, "_fused_qkv_weight")
+            fused_b = getattr(self, "_fused_qkv_bias", None)
+            qkv = None
+            # Optional MI350 path: route fused QKV through OpenPI's aiter GEMM dispatcher
+            # (so it can use tuned GEMM configs).
+            if os.environ.get("OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER", "0") == "1":
+                try:
+                    from openpi.models_pytorch.aiter_ops import aiter_linear, get_use_aiter_gemm
+
+                    if get_use_aiter_gemm():
+                        qkv = aiter_linear(hidden_states, fused_w, fused_b)
+                except Exception:
+                    qkv = None
+            if qkv is None:
+                qkv = nn.functional.linear(hidden_states, fused_w, fused_b)
+            queries, keys, values = qkv.split(self.embed_dim, dim=-1)
+        else:
+            queries = self.q_proj(hidden_states)
+            keys = self.k_proj(hidden_states)
+            values = self.v_proj(hidden_states)
 
         queries = queries.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         keys = keys.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
@@ -414,6 +434,42 @@ class SiglipAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights
+
+
+def fuse_siglip_qkv_projections(model: nn.Module, verbose: bool = True) -> int:
+    """Fuse SigLIP attention QKV projections (3 GEMMs -> 1 GEMM).
+
+    This is an inference optimization. Call after weights are loaded (and ideally
+    before `torch.compile` is first triggered).
+    """
+    fused = 0
+    for module in model.modules():
+        # Avoid importing the class from another module path; this file is meant
+        # to be copied into `transformers`, so we rely on the runtime class name.
+        if module.__class__.__name__ != "SiglipAttention":
+            continue
+        if not (hasattr(module, "q_proj") and hasattr(module, "k_proj") and hasattr(module, "v_proj")):
+            continue
+        if getattr(module, "_use_fused_qkv", False) and hasattr(module, "_fused_qkv_weight"):
+            continue
+        try:
+            fused_w = torch.cat(
+                [module.q_proj.weight.data, module.k_proj.weight.data, module.v_proj.weight.data], dim=0
+            )
+            module.register_buffer("_fused_qkv_weight", fused_w)
+            # SigLIP uses bias on these projections.
+            if getattr(module.q_proj, "bias", None) is not None:
+                fused_b = torch.cat(
+                    [module.q_proj.bias.data, module.k_proj.bias.data, module.v_proj.bias.data], dim=0
+                )
+                module.register_buffer("_fused_qkv_bias", fused_b)
+            module._use_fused_qkv = True
+            fused += 1
+        except Exception:
+            continue
+    if verbose:
+        print(f"Fused {fused} SigLIP QKV projections")
+    return fused
 
 
 # Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->Siglip

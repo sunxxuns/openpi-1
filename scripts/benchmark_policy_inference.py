@@ -212,6 +212,16 @@ def main():
         if os.environ.get("USE_FUSED_PROJECTIONS", "0") == "1":
             print(f"Warning: Could not fuse projections: {e}")
 
+    # Optional: fuse SigLIP vision QKV projections (3 GEMMs -> 1 GEMM).
+    # This is separate from Gemma QKV fusion above.
+    if os.environ.get("OPENPI_FUSE_SIGLIP_QKV", "0") == "1":
+        try:
+            from transformers.models.siglip.modeling_siglip import fuse_siglip_qkv_projections
+
+            fuse_siglip_qkv_projections(model, verbose=True)
+        except Exception as e:
+            print(f"Warning: Could not fuse SigLIP QKV projections: {e}")
+
     # Skip expensive mask checks in aiter attention (benchmark-only)
     if os.environ.get("AITER_MASK_OVERRIDE", "0") == "1":
         try:

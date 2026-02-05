@@ -4,19 +4,20 @@
 
 **Problem**: MI350 runs at ~1000W vs H200 ~700W on this workload; we want perf/W parity.
 **Target**: 23ms latency to match H200 perf/W (\(700/1000 \times 32.9\text{ms} \approx 23.0\text{ms}\)).
-**Achieved (policy inference E2E)**: **~22.2ms mean** on MI350 for the default end-to-end policy inference benchmark by
-skipping fully-masked cameras (drop their image tokens) + manual full-call CUDAGraph replay + SDPA KV-cache fast-path + aiter tuned GEMM.
-**Note**: If all 3 images are present (no fully-masked camera), best-known is closer to **~26ms** and remains compute-bound.
+**Achieved (policy inference E2E)**: **~21.2ms mean** on MI350 for the default end-to-end policy inference benchmark by
+skipping fully-masked cameras (drop their image tokens) + **SigLIP QKV fusion** + manual full-call CUDAGraph replay + SDPA KV-cache fast-path + aiter tuned GEMM.
+**Note**: If all 3 images are present (no fully-masked camera), best-known is closer to **~24.8–25.0ms** and remains compute-bound.
 
 ### Update: policy inference benchmark (real workload)
 
 For the actual OpenPI Pi0 end-to-end policy inference benchmark (`scripts/benchmark_policy_inference.py`),
-we improved the MI350 result from **35.7ms** (torch.compile baseline) to **~22.2ms** by combining:
+we improved the MI350 result from **35.7ms** (torch.compile baseline) to **~21.2ms** by combining:
 
 - Manual full-call **CUDAGraph capture+replay** (`OPENPI_MANUAL_CUDAGRAPH=1`)
 - **aiter tuned GEMM** routing for `nn.Linear`
 - **KV-cache attention fast-path** using SDPA (`OPENPI_EAGER_ATTN_USE_SDPA=1`)
 - **Skip fully-masked cameras** and drop their image tokens (`OPENPI_SKIP_MASKED_IMAGES=1`)
+ - **SigLIP QKV fusion** (`OPENPI_FUSE_SIGLIP_QKV=1`)
 
 This **does** reach the 23ms perf/watt target for the default benchmark (where at least one camera is fully masked).
 If all cameras are present, the best-known config is still ~26ms and is primarily **GEMM/compute bound**.

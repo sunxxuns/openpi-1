@@ -35,7 +35,7 @@ We track **end-to-end Pi0 policy inference** (3.5B params, batch=1, 10 denoising
 |-----|---------------|---------|------------|
 | NVIDIA H200 | torch.compile (bf16) | 32.9 ms | 30.4 Hz |
 | AMD MI350 | torch.compile baseline | 35.7 ms | 28.0 Hz |
-| **AMD MI350** | **best-known** (manual full-call CUDAGraph + SDPA KV-cache + skip fully-masked cameras + tuned GEMMs) | **~22.2 ms** | **~45.0 Hz** |
+| **AMD MI350** | **best-known** (manual full-call CUDAGraph + SDPA KV-cache + SigLIP QKV fusion + skip fully-masked cameras + tuned GEMMs) | **~21.2 ms** | **~47.1 Hz** |
 
 Perf/W target (match H200 at ~700W vs MI350 ~1000W): \(700/1000 \times 32.9\text{ms} \approx 23.0\text{ms}\).
 The MI350 best-known config meets this target on the default benchmark (where one camera is fully masked).
@@ -45,6 +45,7 @@ Notes:
 - `OPENPI_SKIP_MASKED_IMAGES=1` drops image tokens for fully-masked cameras (e.g. 788→532 tokens in the default benchmark),
   which changes the hot GEMM shapes. The repo includes extra tuned configs in `configs/openpi_bf16_tuned_gemm.csv`, and
   `scripts/benchmark_policy_inference.py` auto-loads them unless you override `AITER_CONFIG_GEMM_BF16`.
+- `OPENPI_FUSE_SIGLIP_QKV=1` fuses SigLIP vision tower Q/K/V projections (3 GEMMs → 1 GEMM). This is a consistent win on MI350.
 - Default model behavior (including CUDA/H200 traces) is unchanged unless you explicitly set `OPENPI_SKIP_MASKED_IMAGES=1`.
 
 
