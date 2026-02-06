@@ -346,13 +346,17 @@ class PaliGemmaWithExpertModel(nn.Module):
         gate_up_count = 0
 
         # Optional fused activation hook
+        # When OPENPI_NATIVE_GELU=1, skip the custom kernel and let torch.compile
+        # handle GELU natively (eliminates graph breaks, enables better Inductor fusion).
+        use_native_gelu = os.environ.get("OPENPI_NATIVE_GELU", "1") == "1"
         gelu_tanh_and_mul = None
-        try:
-            from openpi.models_pytorch.aiter_ops import gelu_tanh_and_mul as _gelu_tanh_and_mul
+        if not use_native_gelu:
+            try:
+                from openpi.models_pytorch.aiter_ops import gelu_tanh_and_mul as _gelu_tanh_and_mul
 
-            gelu_tanh_and_mul = _gelu_tanh_and_mul
-        except Exception:
-            gelu_tanh_and_mul = None
+                gelu_tanh_and_mul = _gelu_tanh_and_mul
+            except Exception:
+                gelu_tanh_and_mul = None
 
         models = [self.paligemma.language_model, self.gemma_expert.model]
         for model in models:

@@ -164,7 +164,7 @@ def _configure_inductor_for_amd():
             inductor_config.pattern_matcher = True
             # Allow experiments: more fusion can reduce kernel count (helps hipGraphLaunch)
             # but may also regress kernel quality on ROCm. Default remains conservative.
-            inductor_config.aggressive_fusion = os.environ.get("OPENPI_AGGRESSIVE_FUSION", "0") == "1"
+            inductor_config.aggressive_fusion = os.environ.get("OPENPI_AGGRESSIVE_FUSION", "1") == "1"
             if hasattr(inductor_config.triton, "multi_kernel"):
                 # multi_kernel>1 can reduce launch count for some patterns; keep default=1
                 inductor_config.triton.multi_kernel = int(os.environ.get("OPENPI_TRITON_MULTI_KERNEL", "1"))

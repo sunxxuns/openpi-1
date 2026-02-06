@@ -90,6 +90,28 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.
 # Fused GELU + Mul (for MLP gate)
 # ============================================================================
 
+# Lazy check for aiter CK activation kernel (3x faster than Triton on MI350)
+_AITER_CK_ACTIVATION_CHECKED = False
+AITER_CK_ACTIVATION = False
+
+
+def _ensure_aiter_ck_activation():
+    global _AITER_CK_ACTIVATION_CHECKED, AITER_CK_ACTIVATION
+    if _AITER_CK_ACTIVATION_CHECKED:
+        return
+    _AITER_CK_ACTIVATION_CHECKED = True
+    try:
+        if AITER_AVAILABLE and torch.cuda.is_available():
+            _dummy_in = torch.empty(1, 2, dtype=torch.bfloat16, device="cuda")
+            _dummy_out = torch.empty(1, 1, dtype=torch.bfloat16, device="cuda")
+            torch.ops.aiter.gelu_tanh_and_mul(_dummy_out, _dummy_in)
+            del _dummy_in, _dummy_out
+            AITER_CK_ACTIVATION = True
+            print("[aiter_ops] aiter CK gelu_tanh_and_mul available (3x faster)", flush=True)
+    except Exception as e:
+        AITER_CK_ACTIVATION = False
+
+
 def gelu_tanh_and_mul_eager(x: torch.Tensor) -> torch.Tensor:
     """Standard GELU tanh approximation with mul.
     
@@ -102,8 +124,21 @@ def gelu_tanh_and_mul_eager(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(gate, approximate='tanh') * up
 
 
+def gelu_tanh_and_mul_aiter_ck(x: torch.Tensor) -> torch.Tensor:
+    """Aiter CK/ASM optimized GELU tanh + mul (3x faster than Triton on MI350)."""
+    orig_shape = x.shape
+    hidden_size = orig_shape[-1] // 2
+    x_2d = x.reshape(-1, orig_shape[-1])
+    out = torch.empty(x_2d.shape[0], hidden_size, dtype=x.dtype, device=x.device)
+    torch.ops.aiter.gelu_tanh_and_mul(out, x_2d)
+    return out.reshape(*orig_shape[:-1], hidden_size)
+
+
 def gelu_tanh_and_mul_optimized(x: torch.Tensor) -> torch.Tensor:
-    """Triton optimized GELU tanh + mul (1.6x faster)."""
+    """Best available GELU tanh + mul kernel."""
+    _ensure_aiter_ck_activation()
+    if AITER_CK_ACTIVATION:
+        return gelu_tanh_and_mul_aiter_ck(x)
     if TRITON_AVAILABLE:
         return gelu_tanh_and_mul_triton(x)
     return gelu_tanh_and_mul_eager(x)

@@ -18,6 +18,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import torch
 import numpy as np
 
+
+def _safe_load_pt(path: str):
+    """Load a .pt file, handling TorchVersion unpickling issues."""
+    try:
+        return torch.load(path, weights_only=True)
+    except Exception:
+        try:
+            return torch.load(path, weights_only=False)
+        except TypeError:
+            return torch.load(path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", type=str, default=None,
@@ -149,7 +161,7 @@ def main():
     
     # Compare with baseline if provided
     if args.baseline and os.path.exists(args.baseline):
-        baseline = torch.load(args.baseline, weights_only=True)
+        baseline = _safe_load_pt(args.baseline)
         baseline_actions = baseline['actions']
         baseline_noise = baseline.get('noise', None)
         
