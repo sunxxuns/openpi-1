@@ -1,6 +1,5 @@
 # Benchmark results (Pi0 policy inference, E2E)
 
-This README intentionally contains **only** the latest benchmark results for the OpenPI **Pi0 policy inference** workload.
 
 ## Latest headline results (B=1, 10 denoising steps)
 
@@ -9,7 +8,6 @@ This README intentionally contains **only** the latest benchmark results for the
 | **NVIDIA H200** | 700 | **25.35** | **39.45** |
 | **AMD MI350** | 1000 | **25.3** | **39.47** |
 
-Same workload, same model, same inputs. Apples-to-apples comparison.
 
 ## Batch size scaling
 
@@ -24,7 +22,7 @@ All optimizations enabled. 10 denoising steps. H200 @ 700W, MI350 @ 1000W.
 | 16 | 121.9 | 131.2 | 175.1 | 91.4 | 1.44x |
 | 32 | 217.8 | 146.9 | 340.5 | 94.0 | 1.56x |
 | **64** | **416.3** | **153.7** | **655.9** | **97.6** | **1.58x** |
-| 128 | OOM (kernel fault) | - | 1638.4 | 78.1 | - |
+
 
 MI350 peak: **153.7 samples/s** at BSZ 64 (1.58x H200 peak of 97.6)
 
