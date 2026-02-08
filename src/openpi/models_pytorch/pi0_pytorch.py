@@ -155,19 +155,50 @@ def _configure_inductor_for_amd():
             # -----------------------------------------------------------------
             inductor_config.max_autotune_gemm_backends = "ATEN"
             inductor_config.max_autotune = False
-            inductor_config.coordinate_descent_tuning = False
+            # coordinate_descent_tuning: tunes Triton kernel configs (block sizes,
+            # num_warps, etc.) per-kernel without full autotune.  Longer first
+            # compile but better kernels.
+            inductor_config.coordinate_descent_tuning = (
+                os.environ.get("OPENPI_COORD_DESCENT", "1") == "1"
+            )
 
             # -----------------------------------------------------------------
-            # Fusion: keep the good defaults (avoid over-fusing huge graphs)
+            # Fusion: maximise fusion to reduce kernel launch count
             # -----------------------------------------------------------------
             inductor_config.epilogue_fusion = True
             inductor_config.pattern_matcher = True
-            # Allow experiments: more fusion can reduce kernel count (helps hipGraphLaunch)
-            # but may also regress kernel quality on ROCm. Default remains conservative.
             inductor_config.aggressive_fusion = os.environ.get("OPENPI_AGGRESSIVE_FUSION", "1") == "1"
+            # combo_kernels: combine multiple small elementwise kernels into one
+            # launch.  Disabled: triggers Triton codegen bug on this graph.
+            if hasattr(inductor_config, "combo_kernels"):
+                inductor_config.combo_kernels = (
+                    os.environ.get("OPENPI_COMBO_KERNELS", "0") == "1"
+                )
+            # benchmark_kernel: benchmark different Triton kernel implementations
+            # per op and pick the fastest. Lighter than max_autotune.
+            if hasattr(inductor_config, "benchmark_kernel"):
+                inductor_config.benchmark_kernel = (
+                    os.environ.get("OPENPI_BENCHMARK_KERNEL", "1") == "1"
+                )
+            # group_fusion: fuse groups of similar operations together.
+            if hasattr(inductor_config, "group_fusion"):
+                inductor_config.group_fusion = (
+                    os.environ.get("OPENPI_GROUP_FUSION", "1") == "1"
+                )
             if hasattr(inductor_config.triton, "multi_kernel"):
-                # multi_kernel>1 can reduce launch count for some patterns; keep default=1
                 inductor_config.triton.multi_kernel = int(os.environ.get("OPENPI_TRITON_MULTI_KERNEL", "1"))
+            # max_fusion_size: raise from 64 to allow bigger fused kernels
+            # (reduces total kernel count in the HIP graph).
+            inductor_config.max_fusion_size = int(
+                os.environ.get("OPENPI_MAX_FUSION_SIZE", "128")
+            )
+            # shape_padding: pad tensor dims to power-of-2 for better Triton perf.
+            inductor_config.shape_padding = True
+            # freezing: enable constant-folding / weight freezing for inference.
+            if hasattr(inductor_config, "freezing"):
+                inductor_config.freezing = (
+                    os.environ.get("OPENPI_FREEZING", "1") == "1"
+                )
 
             # -----------------------------------------------------------------
             # Memory planning
@@ -321,7 +352,10 @@ class PI0Pytorch(nn.Module):
             self.register_buffer("_openpi_suffix_att_mask_1d", att_1d, persistent=False)
 
         _maybe_enable_inductor_compile_logging()
-        torch.set_float32_matmul_precision("high")
+        # TF32 is NVIDIA-only; skip on ROCm to avoid misleading warnings.
+        is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+        if not is_rocm:
+            torch.set_float32_matmul_precision("high")
         
         # Configure dynamo to handle dynamic KV cache shapes
         import torch._dynamo.config as dynamo_config
@@ -510,19 +544,45 @@ class PI0Pytorch(nn.Module):
         if active_pattern is None or len(active_pattern) != len(images):
             active_pattern = tuple(True for _ in images)
 
+        # Perf: batch all active images into a single SigLIP forward pass.
+        # This reduces kernel launch overhead and improves GPU utilization
+        # (one forward with batch_size=N_active vs N_active separate forwards).
+        batch_siglip = os.environ.get("OPENPI_BATCH_SIGLIP", "1") == "1"
+        active_images = []
+        active_masks = []
         for img, img_mask, is_active in zip(images, img_masks, active_pattern, strict=True):
             if skip_masked_images and not is_active:
                 continue
+            active_images.append(img)
+            active_masks.append(img_mask)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+        if batch_siglip and len(active_images) > 1:
+            # Stack images along batch dim: [B, 3, 224, 224] × N -> [B*N, 3, 224, 224]
+            bsize = active_images[0].shape[0]
+            stacked = torch.cat(active_images, dim=0)  # [B*N, 3, 224, 224]
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            def batched_image_embed_func(stacked):
+                return self.paligemma_with_expert.embed_image(stacked)
 
-            bsize, num_img_embs = img_emb.shape[:2]
+            all_embs = self._apply_checkpoint(batched_image_embed_func, stacked)
+            # all_embs: [B*N, num_img_embs, embed_dim] -> split back
+            num_img_embs = all_embs.shape[1]
+            per_img_embs = all_embs.reshape(len(active_images), bsize, num_img_embs, -1)
+            for i, img_mask in enumerate(active_masks):
+                img_emb = per_img_embs[i]  # [B, num_img_embs, embed_dim]
+                embs.append(img_emb)
+                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+        else:
+            for img, img_mask in zip(active_images, active_masks, strict=True):
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+
+                bsize, num_img_embs = img_emb.shape[:2]
+
+                embs.append(img_emb)
+                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -719,6 +779,7 @@ class PI0Pytorch(nn.Module):
         t_schedule = times["t"]
 
         x_t = noise
+
         # Use for loop instead of while to avoid torch.compile recursion issues
         # The while loop `while time >= -dt / 2` runs exactly num_steps iterations
         for step in range(num_steps):
@@ -881,6 +942,7 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
