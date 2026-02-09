@@ -1,27 +1,29 @@
 ## MI350 Best Known Config (do not regress)
 
-This file exists to prevent “we forgot the magic env vars” regressions.
+This file exists to prevent "we forgot the magic env vars" regressions.
 
 ### Current best result (policy inference E2E)
 
-- **~21.2 ms mean** (≈ **47.1 Hz**) with:
-  - `OPENPI_SKIP_MASKED_IMAGES=1` (skip fully-masked cameras; drops their image tokens)
+- **~23.7 ms mean** (≈ **42.2 Hz**) with all 3 cameras active (no skip-masked-images):
+  - `OPENPI_BATCH_SIGLIP=1` (batch 3 images into one SigLIP forward pass)
   - `OPENPI_EAGER_ATTN_USE_SDPA=1`
   - `OPENPI_FUSE_SIGLIP_QKV=1` (SigLIP vision tower: fuse Q/K/V projections; 3 GEMMs → 1 GEMM)
-  - tuned bf16 GEMM configs (including fused-projection shapes, the M=532 variants, and the fused SigLIP QKV shape in `configs/openpi_bf16_tuned_gemm.csv`)
+  - `OPENPI_COORD_DESCENT=1` (Inductor coordinate descent kernel tuning)
+  - `OPENPI_BENCHMARK_KERNEL=1` (Inductor benchmarks kernel implementations per op)
+  - `OPENPI_GROUP_FUSION=1` (Inductor fuses groups of similar operations)
+  - `OPENPI_MAX_FUSION_SIZE=128` (larger fused kernels, fewer HIP graph launches)
+  - `OPENPI_FREEZING=1` (constant-fold weights for inference)
+  - tuned bf16 GEMM configs in `configs/openpi_bf16_tuned_gemm.csv`
   - fused projections routed through aiter tuned GEMM
-- **~24.8–25.0 ms mean** (≈ **40 Hz**) if all 3 images are present (no fully-masked camera), or if you disable `OPENPI_SKIP_MASKED_IMAGES` (with SigLIP QKV fusion enabled)
-- **~26.8 ms mean** (≈ **37.4 Hz**) without routing fused projections to aiter
-- **~31.3 ms mean** (≈ **32.0 Hz**) if you regress back to the slow KV-cache attention path
+- **~182.4 samples/s** peak throughput at BSZ 64 (1.87x H200)
 
 ### What to run (policy inference E2E)
 
 ```bash
 cd /sgl-workspace/openpi
 
-# Minimal knobs you should set explicitly:
 AITER_PRESHUFFLE_WEIGHTS=0 \
-OPENPI_SKIP_MASKED_IMAGES=1 \
+OPENPI_SKIP_MASKED_IMAGES=0 \
 OPENPI_MANUAL_CUDAGRAPH=1 \
 OPENPI_EAGER_ATTN_USE_SDPA=1 \
 OPENPI_FUSE_SIGLIP_QKV=1 \
@@ -29,6 +31,12 @@ OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
 OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1 \
 OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
 TORCH_COMPILE_MODE=default \
+OPENPI_BATCH_SIGLIP=1 \
+OPENPI_COORD_DESCENT=1 \
+OPENPI_BENCHMARK_KERNEL=1 \
+OPENPI_GROUP_FUSION=1 \
+OPENPI_MAX_FUSION_SIZE=128 \
+OPENPI_FREEZING=1 \
 python scripts/benchmark_policy_inference.py
 ```
 
@@ -44,14 +52,12 @@ These must remain true (either by script defaults or by explicit env vars):
   - Avoids Inductor ROCm recursion issues and keeps the compiled graph/kernel-count low.
 - `OPENPI_EAGER_ATTN_USE_SDPA=1`
   - Enables an SDPA fast-path for the **q_len != k_len** KV-cache attention case that otherwise falls back to
-    explicit `bmm + softmax + bmm`. This is the largest single win toward the 23ms perf/W target.
-- `OPENPI_SKIP_MASKED_IMAGES=1`
-  - If an image is fully masked out for the whole batch (e.g. right wrist camera absent), skip the SigLIP
-    vision tower for that image and **drop its image tokens entirely**. This reduces prefix length and KV
-    cache length (e.g. 788→532 tokens in the default benchmark) and is the main reason we hit ~22ms.
+    explicit `bmm + softmax + bmm`. This is the largest single win.
+- `OPENPI_BATCH_SIGLIP=1`
+  - Batch all active camera images into a single SigLIP forward pass (M=768 instead of 3 × M=256).
+    Same FLOPs, better GPU utilization, fewer kernel launches.
 - `OPENPI_FUSE_SIGLIP_QKV=1`
-  - Fuses SigLIP vision tower Q/K/V projections (3 GEMMs → 1 GEMM). This is a consistent win for both
-    the skip-masked and all-cameras-present cases.
+  - Fuses SigLIP vision tower Q/K/V projections (3 GEMMs → 1 GEMM).
 - `AITER_PRESHUFFLE_WEIGHTS=0`
   - Global bpreshuffle duplicates weights (memory) and can regress small-M decode-ish GEMMs; best-known config keeps it off.
 - `OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1` (and a large `..._M_THRESH`)
@@ -59,6 +65,15 @@ These must remain true (either by script defaults or by explicit env vars):
 - `OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1`
   - Routes the **fused SigLIP QKV** projection through aiter GEMM so it can use the tuned config entry for
     the \(M=256, N=3456, K=1152\) shape.
+- `OPENPI_COORD_DESCENT=1`
+  - Inductor coordinate descent tuning for Triton kernel configs (block sizes, num_warps). Longer first
+    compile but better steady-state kernels.
+- `OPENPI_BENCHMARK_KERNEL=1`
+  - Inductor benchmarks different kernel implementations per op and picks the fastest.
+- `OPENPI_GROUP_FUSION=1`
+  - Inductor fuses groups of similar operations together.
+- `OPENPI_FREEZING=1`
+  - Enables constant-folding / weight freezing for inference.
 
 ### How to profile / confirm
 
@@ -67,9 +82,8 @@ PROFILE=1 PROFILE_GRAPH_REPLAY=0 PROFILE_DIR=traces/comp_best_repro \
 AITER_PRESHUFFLE_WEIGHTS=0 OPENPI_MANUAL_CUDAGRAPH=1 OPENPI_EAGER_ATTN_USE_SDPA=1 \
 OPENPI_FUSE_SIGLIP_QKV=1 OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
 OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1 OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
-TORCH_COMPILE_MODE=default \
+TORCH_COMPILE_MODE=default OPENPI_BATCH_SIGLIP=1 OPENPI_COORD_DESCENT=1 \
+OPENPI_BENCHMARK_KERNEL=1 OPENPI_GROUP_FUSION=1 OPENPI_MAX_FUSION_SIZE=128 \
+OPENPI_FREEZING=1 \
 python scripts/benchmark_policy_inference.py
-
-python scripts/analyze_policy_trace.py traces/comp_best_repro/policy_inference_compiled_default_call.json
 ```
-
