@@ -1,11 +1,16 @@
-"""Maximum throughput configuration for AMD MI350.
+"""Maximum throughput configuration for AMD MI300/MI350.
+
+Supports both MI300X (gfx942, ~750W) and MI350 (gfx950, ~1000W).
 
 MI350 draws 1000W vs H200's 700W, so we need proportionally better performance:
 - H200: 32.9ms @ 700W = 0.047 samples/s/W
-- MI350 current: 35.7ms @ 1000W = 0.028 samples/s/W  
+- MI350 current: 35.7ms @ 1000W = 0.028 samples/s/W
 - MI350 target: 23ms @ 1000W = 0.043 samples/s/W (to match H200 perf/watt)
 
-Key optimizations to MAXIMIZE throughput (target: 23ms, 34% improvement needed):
+MI300X draws ~750W vs H200's 700W (closer to parity):
+- MI300X target: ~30.4ms @ 750W to match H200 perf/watt
+
+Key optimizations to MAXIMIZE throughput:
 1. Enable HIP graphs to reduce kernel launch overhead (202ms -> <10ms)
 2. Reduce synchronization points (338ms -> ~50ms)
 3. Maximize GPU utilization (keep all 304 CUs busy)
@@ -16,7 +21,7 @@ Profile analysis shows MI350 wastes 47% of time on overhead:
 - MI350: 1147ms total, 338ms sync (29%), 202ms launch (18%), 452ms GEMM
 - H200:  468ms total,  90ms sync (19%),   3ms launch (1%),   12ms GEMM
 
-Target: Eliminate overhead to achieve 23ms latency (match H200 perf/watt).
+Target: Eliminate overhead to achieve target latency (match H200 perf/watt).
 """
 
 import os
@@ -93,7 +98,7 @@ def configure_max_throughput_inductor():
         # Enable persistent kernels (reduce launch overhead)
         inductor_config.triton.persistent_reductions = True
         
-        # Tune block sizes for MI350 (gfx950) CU count (304 CUs)
+        # Tune block sizes for MI300/MI350 CU count (304 CUs)
         # Smaller blocks = more parallelism = better utilization
         if hasattr(inductor_config, 'triton_override_block_sizes'):
             # Use block sizes that map well to 304 CUs
@@ -255,20 +260,28 @@ def get_power_efficient_compile_options():
         }
 
 
-def calculate_target_latency(h200_latency_ms: float = 32.9, h200_power_w: float = 700, mi350_power_w: float = 1000) -> dict:
-    """Calculate target MI350 latency to match H200 perf/watt.
+def calculate_target_latency(h200_latency_ms: float = 32.9, h200_power_w: float = 700, mi350_power_w: float = None) -> dict:
+    """Calculate target MI300/MI350 latency to match H200 perf/watt.
     
-    Since MI350 draws more power, it should achieve proportionally lower latency
-    to deliver the same performance per watt.
+    Since AMD GPUs may draw more power, they should achieve proportionally lower
+    latency to deliver the same performance per watt.
     
     Args:
         h200_latency_ms: H200 latency in milliseconds
         h200_power_w: H200 power consumption in watts
-        mi350_power_w: MI350 power consumption in watts
+        mi350_power_w: AMD GPU power consumption in watts (auto-detected if None)
     
     Returns:
         Dict with target metrics
     """
+    # Auto-detect power based on GPU architecture
+    if mi350_power_w is None:
+        try:
+            from openpi.models_pytorch.mi350_kernel_configs import is_mi300
+            mi350_power_w = 750 if is_mi300() else 1000
+        except Exception:
+            mi350_power_w = 1000  # fallback
+
     # H200 perf/watt
     h200_throughput = 1000 / h200_latency_ms  # samples/s
     h200_perf_per_watt = h200_throughput / h200_power_w

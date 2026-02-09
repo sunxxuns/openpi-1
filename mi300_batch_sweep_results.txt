@@ -1,0 +1,18 @@
+MI300 Batch Size Sweep Results
+==============================
+Date: Mon Feb  9 09:08:45 UTC 2026
+
+BSZ=2  Mean=36.3ms  P50=36.2ms  Hz=27.53
+  Samples/s=55.05
+BSZ=4  Mean=54.3ms  P50=54.2ms  Hz=18.41
+  Samples/s=73.66
+BSZ=8  Mean=91.2ms  P50=91.2ms  Hz=10.97
+  Samples/s=87.73
+BSZ=16  Mean=165.1ms  P50=165.2ms  Hz=6.06
+  Samples/s=96.92
+BSZ=32  Mean=307.9ms  P50=307.9ms  Hz=3.25
+  Samples/s=103.95
+BSZ=64  Mean=581.4ms  P50=581.1ms  Hz=1.72
+  Samples/s=110.08
+
+Done.

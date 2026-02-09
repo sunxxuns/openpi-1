@@ -1,10 +1,18 @@
-"""MI350-optimized kernel configurations for better power efficiency.
+"""AMD GPU kernel configurations for power efficiency.
+
+Supports both MI300 (gfx942) and MI350 (gfx950).
 
 AMD MI350 (gfx950) specifications:
 - 304 Compute Units (CUs)
 - 192 GB HBM3 memory
 - 8 TB/s memory bandwidth
 - TDP: ~750W (but can spike to 1000W+ under heavy load)
+
+AMD MI300X (gfx942) specifications:
+- 304 Compute Units (CUs)
+- 192 GB HBM3 memory (up to 256 GB on some SKUs)
+- 5.3 TB/s memory bandwidth
+- TDP: ~750W
 
 Key insights for power optimization:
 1. Smaller block sizes = better occupancy = more parallelism = faster completion
@@ -22,7 +30,7 @@ import torch
 
 @dataclass
 class KernelConfig:
-    """Configuration for a Triton kernel optimized for MI350."""
+    """Configuration for a Triton kernel optimized for MI300/MI350."""
     block_size: int
     num_warps: int
     num_stages: int
@@ -80,15 +88,37 @@ MI350_KERNEL_CONFIGS = {
 }
 
 
-def get_mi350_cu_count() -> int:
-    """Get the number of Compute Units on MI350."""
-    # MI350 has 304 CUs
-    # We can verify this from device properties
+def get_gpu_arch() -> str:
+    """Detect GPU architecture string (e.g. 'gfx942', 'gfx950')."""
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        if hasattr(props, "gcnArchName"):
+            return props.gcnArchName.split(":")[0]
+    return "unknown"
+
+
+def is_mi300() -> bool:
+    """Check if running on MI300 (gfx942)."""
+    return get_gpu_arch().startswith("gfx942")
+
+
+def is_mi350() -> bool:
+    """Check if running on MI350 (gfx950)."""
+    return get_gpu_arch().startswith("gfx950")
+
+
+def get_cu_count() -> int:
+    """Get the number of Compute Units on MI300/MI350."""
+    # Both MI300X and MI350 have 304 CUs
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         # multiprocessor_count gives SM count (NVIDIA) or CU count (AMD)
         return props.multi_processor_count
-    return 304  # Default for MI350
+    return 304  # Default for MI300/MI350
+
+
+# Backwards compatibility alias
+get_mi350_cu_count = get_cu_count
 
 
 def calculate_optimal_grid_size(
@@ -106,7 +136,7 @@ def calculate_optimal_grid_size(
     Returns:
         Optimal number of thread blocks
     """
-    cu_count = get_mi350_cu_count()
+    cu_count = get_cu_count()
     
     # MI350 can run up to 32 wavefronts (warps) per CU
     # Each wavefront is 64 threads
@@ -230,7 +260,7 @@ def get_optimal_batch_size(
     if torch.cuda.is_available():
         total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     else:
-        total_mem = 192  # MI350 default
+        total_mem = 192  # MI300/MI350 default
     
     # Estimate memory per sample (rough approximation)
     # Activation memory scales with batch * seq * hidden
@@ -258,7 +288,7 @@ def get_optimal_batch_size(
 
 # Environment variable configuration
 def setup_mi350_environment():
-    """Set up environment variables for optimal MI350 power efficiency."""
+    """Set up environment variables for optimal MI300/MI350 power efficiency."""
     env_vars = {
         # HIP runtime optimization
         "HIP_LAUNCH_BLOCKING": "0",
@@ -287,13 +317,16 @@ def setup_mi350_environment():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("MI350 KERNEL CONFIGURATION")
+    print("AMD GPU KERNEL CONFIGURATION")
     print("=" * 60)
     
     # Get hardware info
+    gpu_arch = get_gpu_arch()
+    gpu_type = "MI300" if is_mi300() else ("MI350" if is_mi350() else "Unknown")
     if torch.cuda.is_available():
         print(f"\nDevice: {torch.cuda.get_device_name(0)}")
-        print(f"Compute Units: {get_mi350_cu_count()}")
+        print(f"GPU Type: {gpu_type} ({gpu_arch})")
+        print(f"Compute Units: {get_cu_count()}")
         props = torch.cuda.get_device_properties(0)
         print(f"Memory: {props.total_memory / 1e9:.1f} GB")
     

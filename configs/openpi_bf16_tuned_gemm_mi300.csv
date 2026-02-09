@@ -1,0 +1,9 @@
+cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+256,532,2048,2048,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618302,0,20.0,,0.0,220.0,630.0
+256,532,2048,16384,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618302,0,66.0609,,0.0,540.44,1312.74
+256,532,2560,2048,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618372,0,17.445,,0.0,319.77,882.13
+256,532,32768,2048,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618334,0,104.8866,,0.0,680.77,1632.83
+256,256,3456,1152,True,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618373,0,11.6187,,0.0,175.44,888.39
+256,788,2048,2048,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618302,0,18.0,,0.0,370.0,830.0
+256,788,2560,2048,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618372,0,21.0,,0.0,390.0,950.0
+256,788,2048,16384,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,618302,0,105.0,,0.0,500.0,910.0

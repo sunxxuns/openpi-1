@@ -68,6 +68,30 @@ os.environ.setdefault("OPENPI_NUMERIC_CHECK", "0")  # compare call vs graph repl
 os.environ.setdefault("OPENPI_PROFILE_SHAPES", "0")  # print op tables grouped by input shapes
 
 
+def _detect_gpu_arch() -> str:
+    """Detect the GPU architecture (e.g. gfx942 for MI300, gfx950 for MI350)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            if hasattr(props, "gcnArchName"):
+                # e.g. "gfx942:sramecc+:xnack-"
+                return props.gcnArchName.split(":")[0]
+    except Exception:
+        pass
+    # Fallback: try rocminfo
+    try:
+        import subprocess
+        result = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Name:") and "gfx" in line:
+                return line.split()[-1].strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _maybe_extend_aiter_bf16_tuned_gemm_configs() -> None:
     """Best-effort: add OpenPI's extra aiter GEMM tuned configs.
 
@@ -75,13 +99,31 @@ def _maybe_extend_aiter_bf16_tuned_gemm_configs() -> None:
     cameras), which changes the hot GEMM shapes. We ship additional tuned configs
     in-repo so new machines can reproduce best-known performance without needing
     to modify the aiter installation.
+
+    Automatically selects MI300 (gfx942) or MI350 (gfx950) config based on GPU arch.
     """
     # Respect user overrides.
     if os.environ.get("AITER_CONFIG_GEMM_BF16"):
         return
 
     repo_root = pathlib.Path(__file__).resolve().parents[1]
-    local_cfg = repo_root / "configs" / "openpi_bf16_tuned_gemm.csv"
+
+    # Select config based on GPU architecture.
+    gpu_arch = _detect_gpu_arch()
+    if gpu_arch.startswith("gfx942"):
+        # MI300: use hipblaslt-only config (no gfx950 ASM kernels)
+        local_cfg = repo_root / "configs" / "openpi_bf16_tuned_gemm_mi300.csv"
+        print(f"[openpi] Detected MI300 ({gpu_arch}), using MI300 GEMM config")
+    else:
+        local_cfg = repo_root / "configs" / "openpi_bf16_tuned_gemm.csv"
+        if gpu_arch.startswith("gfx950"):
+            print(f"[openpi] Detected MI350 ({gpu_arch}), using MI350 GEMM config")
+        else:
+            print(f"[openpi] Unknown GPU arch ({gpu_arch}), using default GEMM config")
+
+    if not local_cfg.exists():
+        # Fallback to default config
+        local_cfg = repo_root / "configs" / "openpi_bf16_tuned_gemm.csv"
     if not local_cfg.exists():
         return
 
