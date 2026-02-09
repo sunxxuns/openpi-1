@@ -20,9 +20,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Callable, Optional, Union
+import os
+
+# Global flag to enable aiter attention (AMD optimized kernels)
+# Set via environment variable or programmatically
+USE_AITER_ATTENTION = os.environ.get("USE_AITER_ATTENTION", "0") == "1"
+AITER_AVAILABLE = False
+
+try:
+    import aiter
+    AITER_AVAILABLE = True
+except ImportError:
+    AITER_AVAILABLE = False
+
+def set_use_aiter_attention(enabled: bool):
+    """Enable or disable aiter attention globally."""
+    global USE_AITER_ATTENTION
+    USE_AITER_ATTENTION = enabled
+    if enabled and not AITER_AVAILABLE:
+        raise ImportError("aiter is not installed. Install it to use aiter attention.")
+
+def get_use_aiter_attention() -> bool:
+    """Check if aiter attention is enabled."""
+    return USE_AITER_ATTENTION and AITER_AVAILABLE
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+try:
+    # Optional: route fused F.linear GEMMs through aiter tuned GEMM (MI350).
+    from openpi.models_pytorch.aiter_ops import get_use_aiter_gemm, aiter_linear
+except Exception:
+    def get_use_aiter_gemm() -> bool:  # type: ignore[override]
+        return False
+
+    def aiter_linear(x, weight, bias=None):  # type: ignore[override]
+        return F.linear(x, weight, bias)
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -39,7 +73,13 @@ from ...modeling_outputs import (
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from ...utils import auto_docstring, can_return_tuple, logging
+from typing import TypedDict
+try:
+    from ...utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
 from .configuration_gemma import GemmaConfig
 
 
@@ -122,6 +162,32 @@ class GemmaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # Fused path: single GEMM for gate+up (reduces 2 GEMMs to 1)
+        if hasattr(self, "_use_fused") and self._use_fused and hasattr(self, "_fused_gate_up_weight"):
+            # Optional MI350 experiment: see OPENPI_ROUTE_FUSED_LINEAR_TO_AITER.
+            # Default remains F.linear (best-known stable performance).
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(x.shape[0]) * int(x.shape[1]) if x.ndim == 3 else int(x.shape[0])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_gate_up_weight", self._fused_gate_up_weight)
+                    gate_up = aiter_linear(x, fused_w, bias=None)
+                else:
+                    gate_up = F.linear(x, self._fused_gate_up_weight)
+            else:
+                gate_up = F.linear(x, self._fused_gate_up_weight)
+            if hasattr(self, "_gelu_tanh_and_mul"):
+                hidden = self._gelu_tanh_and_mul(gate_up)
+            else:
+                gate = gate_up[..., : self.intermediate_size]
+                up = gate_up[..., self.intermediate_size :]
+                hidden = self.act_fn(gate) * up
+            return self.down_proj(hidden)
+
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -240,6 +306,31 @@ def eager_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # Optional fast-path for KV-cache causal attention on ROCm:
+    # For q_len != k_len, the attention mask we build for "prefix-lm" style decode is
+    # often equivalent to PyTorch SDPA's causal-with-cache semantics (bottom-right aligned).
+    # When enabled, we try SDPA with `is_causal=True` and no explicit mask, which can
+    # unlock flash-attention kernels and avoid explicit bmm+softmax+bmm.
+    if (
+        os.environ.get("OPENPI_EAGER_ATTN_USE_SDPA", "0") == "1"
+        and attention_mask is not None
+        and query.shape[2] != key_states.shape[2]
+        and dropout == 0.0
+    ):
+        try:
+            sdpa_out = F.scaled_dot_product_attention(
+                query,
+                key_states,
+                value_states,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True,
+            )
+            return sdpa_out.transpose(1, 2).contiguous(), None
+        except Exception:
+            # Conservative fallback to the explicit eager attention below.
+            pass
+
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -251,6 +342,274 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
+
+
+def aiter_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """
+    Attention forward using aiter's optimized bf16 ASM kernels.
+    Uses flash_attn_func for efficient attention computation on AMD GPUs.
+    
+    Flash attention only supports:
+    - Pure causal attention (lower triangular)
+    - Full bidirectional attention (no masking)
+    
+    For cases with complex masking (padding, prefix-LM, cross-attention),
+    falls back to eager attention for correctness.
+    
+    Args:
+        module: The attention module (for num_key_value_groups)
+        query: Query tensor [batch, num_heads, seq_len, head_dim]
+        key: Key tensor [batch, num_kv_heads, seq_len, head_dim]
+        value: Value tensor [batch, num_kv_heads, seq_len, head_dim]
+        attention_mask: Optional attention mask [batch, 1, q_len, k_len]
+        scaling: Softmax scaling factor (typically 1/sqrt(head_dim))
+        dropout: Dropout probability
+    """
+    if not AITER_AVAILABLE:
+        raise RuntimeError("aiter is not available. Please install aiter for AMD optimized attention.")
+    
+    q_len = query.shape[2]
+    k_len = key.shape[2]
+
+    # Debug: print which path we take (flash vs eager) for the first few calls.
+    # Guard against running during torch.compile tracing.
+    try:
+        import os as _os
+        import torch as _torch
+
+        _debug = _os.environ.get("OPENPI_DEBUG_AITER_ATTN", "0") == "1"
+        _debug_limit = int(_os.environ.get("OPENPI_DEBUG_AITER_ATTN_LIMIT", "8"))
+        _is_compiling = False
+        try:
+            _is_compiling = bool(getattr(_torch._dynamo, "is_compiling", lambda: False)())
+        except Exception:
+            _is_compiling = False
+    except Exception:
+        _debug = False
+        _debug_limit = 0
+        _is_compiling = False
+    
+    # Note: q_len != k_len commonly happens for self-attention with KV cache
+    # (queries are the newly appended tokens; keys/values include cached prefix).
+    # Flash attention kernels support q_len != k_len for both causal and non-causal
+    # modes, but we do not support arbitrary rectangular masks here.
+    
+    # Optional override to skip expensive mask checks (benchmarking only)
+    mask_override = getattr(module, "_aiter_mask_type", None)
+    if mask_override == "eager":
+        if _debug and not _is_compiling:
+            cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+            if cnt < _debug_limit:
+                print(
+                    f"[openpi][aiter_attn] FALLBACK eager (override) q_len={q_len} k_len={k_len} override={mask_override}",
+                    flush=True,
+                )
+            module._openpi_aiter_attn_dbg_cnt = cnt + 1
+        return eager_attention_forward(
+            module, query, key, value, attention_mask, scaling, dropout, **kwargs
+        )
+    
+    # Check if we can use flash attention
+    # Flash attention only supports: pure causal OR full bidirectional (no padding mask)
+    can_use_flash = False
+    use_causal = True
+    
+    if mask_override in ("full", "causal"):
+        # Explicit override wins (also enables q_len != k_len).
+        can_use_flash = True
+        use_causal = mask_override == "causal"
+        # Caller is responsible for only using this override when the effective
+        # mask is compatible with full attention ("full") or pure causal ("causal").
+        #
+        # In override mode, the explicit attention mask is unnecessary (and can be
+        # expensive to build / validate), so drop it unconditionally.
+        if attention_mask is not None:
+            attention_mask = None
+    elif attention_mask is None:
+        # No mask = full bidirectional, can use flash
+        can_use_flash = True
+        use_causal = False
+    elif attention_mask is not None:
+        # Check if mask is pure causal (all -inf above diagonal, all 0 on/below)
+        # or full bidirectional (all 0)
+        # Only attempt this check for square masks (q_len == k_len).
+        if q_len != k_len:
+            can_use_flash = False
+        else:
+            mask_2d = attention_mask[0, 0]  # [seq_len, seq_len]
+            unique_vals = torch.unique(mask_2d)
+
+            if len(unique_vals) == 1 and unique_vals[0].item() == 0.0:
+                # All zeros = full bidirectional, can use flash
+                can_use_flash = True
+                use_causal = False
+            elif len(unique_vals) <= 2:
+                # Check if it's pure causal mask
+                is_lower_tri = torch.tril(torch.ones_like(mask_2d, dtype=torch.bool))
+                upper_vals = mask_2d[~is_lower_tri]
+                lower_vals = mask_2d[is_lower_tri]
+
+                # Pure causal: upper triangle all -inf, lower triangle all 0
+                if (upper_vals < -1e9).all() and (lower_vals == 0).all():
+                    can_use_flash = True
+                    use_causal = True
+    
+    # Fall back to eager if mask is complex (e.g., has padding)
+    if not can_use_flash:
+        if _debug and not _is_compiling:
+            cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+            if cnt < _debug_limit:
+                am = "none" if attention_mask is None else f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
+                print(
+                    f"[openpi][aiter_attn] FALLBACK eager q_len={q_len} k_len={k_len} override={mask_override} attn_mask={am}",
+                    flush=True,
+                )
+            module._openpi_aiter_attn_dbg_cnt = cnt + 1
+        return eager_attention_forward(
+            module, query, key, value, attention_mask, scaling, dropout, **kwargs
+        )
+    
+    # NOTE: aiter flash-attn supports MQA/GQA natively (K/V can have fewer heads than Q),
+    # so avoid expand-based `repeat_kv` here. Besides saving work, `repeat_kv` produces
+    # expanded/overlapping views that are problematic for torch.compile and can force
+    # expensive `.contiguous()` copies in the KV-cache case.
+    key_states_h = key
+    value_states_h = value
+    
+    # Transpose to [batch, seq_len, num_heads, head_dim].
+    # Important: do NOT force `.contiguous()` here. The last-dimension remains contiguous
+    # after this transpose (stride(-1) == 1), and forcing contiguous causes extra copies
+    # that show up as standalone to_copy / rope-related kernels in the replay trace.
+    query_states = query.transpose(1, 2)
+    key_states = key_states_h.transpose(1, 2)
+    value_states = value_states_h.transpose(1, 2)
+
+    # NOTE: Some aiter entrypoints (notably `torch.ops.aiter.mha_fwd`) reject tensors with
+    # zero-stride dimensions produced by expand-based GQA/KV repetition, especially when
+    # q_len != k_len (KV-cache case). In that case, we pay the copy once to make K/V
+    # contiguous so we can still use the fast attention kernel.
+    def _needs_contig(x: torch.Tensor) -> bool:
+        try:
+            # We only force contiguity when there are *zero-stride* dims (expand-based views).
+            # Transposed tensors are non-contiguous but usually fine for the aiter op.
+            return any(int(s) == 0 for s in x.stride())
+        except Exception:
+            return True
+
+    # For KV-cache shapes (q_len != k_len), make Q/K/V contiguous if needed.
+    # This avoids aiter runtime/binding issues with expanded/zero-stride tensors.
+    if q_len != k_len and (_needs_contig(query_states) or _needs_contig(key_states) or _needs_contig(value_states)):
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+    
+    # Use aiter's flash attention
+    if _debug and not _is_compiling:
+        cnt = getattr(module, "_openpi_aiter_attn_dbg_cnt", 0)
+        if cnt < _debug_limit:
+            print(
+                f"[openpi][aiter_attn] FLASH q_len={q_len} k_len={k_len} override={mask_override} causal={use_causal}",
+                flush=True,
+            )
+        module._openpi_aiter_attn_dbg_cnt = cnt + 1
+
+    # Prefer calling the underlying compiled op directly (more torch.compile friendly)
+    # instead of the higher-level python wrapper. This avoids extra python-side logic
+    # (padding, branching, returning LSE) during tracing/compilation.
+    use_direct_mha = os.environ.get("OPENPI_AITER_ATTN_DIRECT_MHA", "1") == "1"
+    attn_output = None
+
+    def _call_mha_fwd(q, k, v):
+        # Call the underlying torch op directly (most torch.compile friendly).
+        # aiter's `mha_fwd` schema differs across versions (some include `sink_size`).
+        op = torch.ops.aiter.mha_fwd.default  # type: ignore[attr-defined]
+        schema = str(getattr(op, "_schema", ""))
+        has_sink_size = "sink_size" in schema
+        if has_sink_size:
+            outs = op(
+                q,
+                k,
+                v,
+                dropout if module.training else 0.0,
+                float(scaling),
+                bool(use_causal),
+                -1,  # window_size_left
+                -1,  # window_size_right
+                0,   # sink_size (disabled)
+                False,  # return_softmax_lse
+                False,  # return_dropout_randval
+            )
+        else:
+            outs = op(
+                q,
+                k,
+                v,
+                dropout if module.training else 0.0,
+                float(scaling),
+                bool(use_causal),
+                -1,  # window_size_left
+                -1,  # window_size_right
+                False,  # return_softmax_lse
+                False,  # return_dropout_randval
+            )
+        # aiter mha_fwd returns [out, lse, p, rng_state]
+        return outs[0]
+
+    if use_direct_mha:
+        # First try: keep tensors as-is (avoids extra copies).
+        try:
+            attn_output = _call_mha_fwd(query_states, key_states, value_states)
+        except Exception:
+            attn_output = None
+
+        # Retry with contiguous Q/K/V if needed. Some aiter builds reject transposed
+        # or expanded tensors even when the last dimension is contiguous.
+        if attn_output is None:
+            try:
+                attn_output = _call_mha_fwd(
+                    query_states.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                )
+            except Exception:
+                attn_output = None
+
+    # Final fallback: use PyTorch SDPA (keeps correctness, avoids aiter wrapper schema mismatch).
+    # NOTE: We intentionally avoid `aiter.flash_attn_func` here because some aiter versions
+    # call into `mha_fwd` with an argument list that doesn't match the installed op schema.
+    if attn_output is None:
+        try:
+            sdpa_out = F.scaled_dot_product_attention(
+                query,
+                repeat_kv(key_states_h, module.num_key_value_groups),
+                repeat_kv(value_states_h, module.num_key_value_groups),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=bool(use_causal),
+            )
+            return sdpa_out.transpose(1, 2).contiguous(), None
+        except Exception:
+            return eager_attention_forward(
+                module, query, key, value, attention_mask, scaling, dropout, **kwargs
+            )
+
+    return attn_output, None
+
+
+def get_attention_forward_fn():
+    """Get the appropriate attention forward function based on settings."""
+    if get_use_aiter_attention():
+        return aiter_attention_forward
+    return eager_attention_forward
 
 
 class GemmaAttention(nn.Module):
@@ -292,9 +651,54 @@ class GemmaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Check if fused QKV weights are available (reduces 3 GEMMs to 1)
+        if hasattr(self, "_use_fused_qkv") and self._use_fused_qkv and hasattr(self, "_fused_qkv_weight"):
+            q_size = self.q_proj.weight.shape[0]
+            k_size = self.k_proj.weight.shape[0]
+            # Optional MI350 experiment:
+            # Routing fused GEMMs through aiter can help when we have tuned solutions
+            # for the specific (M,N,K) shapes. Keep default as F.linear unless enabled.
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(hidden_states.numel() // hidden_states.shape[-1])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_qkv_weight", self._fused_qkv_weight)
+                    qkv_states = aiter_linear(hidden_states, fused_w, bias=None)
+                else:
+                    qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
+            else:
+                qkv_states = F.linear(hidden_states, self._fused_qkv_weight)
+            query_states = qkv_states[..., :q_size].view(hidden_shape).transpose(1, 2)
+            key_states = qkv_states[..., q_size:q_size + k_size].view(hidden_shape).transpose(1, 2)
+            value_states = qkv_states[..., q_size + k_size:].view(hidden_shape).transpose(1, 2)
+        # Check if fused KV weights are available (reduces 2 GEMMs to 1)
+        elif hasattr(self, "_use_fused_kv") and self._use_fused_kv and hasattr(self, "_fused_kv_weight"):
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            kv_size = self.k_proj.weight.shape[0]
+            route_fused = os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_TO_AITER", "0") == "1"
+            if route_fused and get_use_aiter_gemm():
+                try:
+                    m = int(hidden_states.numel() // hidden_states.shape[-1])
+                except Exception:
+                    m = 0
+                m_thresh = int(os.environ.get("OPENPI_ROUTE_FUSED_LINEAR_M_THRESH", "64"))
+                if m and m <= m_thresh:
+                    fused_w = getattr(self, "_aiter_preshuffled_fused_kv_weight", self._fused_kv_weight)
+                    kv_states = aiter_linear(hidden_states, fused_w, bias=None)
+                else:
+                    kv_states = F.linear(hidden_states, self._fused_kv_weight)
+            else:
+                kv_states = F.linear(hidden_states, self._fused_kv_weight)
+            key_states = kv_states[..., :kv_size].view(hidden_shape).transpose(1, 2)
+            value_states = kv_states[..., kv_size:].view(hidden_shape).transpose(1, 2)
+        else:
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -309,9 +713,24 @@ class GemmaAttention(nn.Module):
                 key_states = torch.cat([past_key_value[self.layer_idx][0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[self.layer_idx][1], value_states], dim=2)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        # Select attention implementation: aiter (if enabled) > config-specified > eager
+        if get_use_aiter_attention():
+            attention_interface: Callable = aiter_attention_forward
+            # ROCm note: historically, compiling through flash-attn could trigger
+            # Inductor issues for some attention cases. With the direct `mha_fwd`
+            # call path and `OPENPI_INDUCTOR_MEMORY_PLANNING=0`, this is now stable
+            # for the OpenPI policy benchmark and significantly reduces kernel count.
+            try:
+                if os.environ.get("OPENPI_DISABLE_COMPILE_AITER_ATTN", "0") == "1":
+                    import torch._dynamo as _dynamo  # type: ignore
+
+                    attention_interface = _dynamo.disable(attention_interface)
+            except Exception:
+                pass
+        elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        else:
+            attention_interface = eager_attention_forward
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -859,4 +1278,9 @@ __all__ = [
     "GemmaForSequenceClassification",
     "GemmaForTokenClassification",
     "GemmaPreTrainedModel",
+    # aiter attention utilities
+    "set_use_aiter_attention",
+    "get_use_aiter_attention",
+    "aiter_attention_forward",
+    "AITER_AVAILABLE",
 ]

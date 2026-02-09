@@ -2,8 +2,68 @@ from collections.abc import Sequence
 import logging
 
 import torch
+import torch.nn.functional as F
+def resize_with_pad_torch(
+    images: torch.Tensor,
+    height: int,
+    width: int,
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    """PyTorch-only resize_with_pad (no JAX dependency).
 
-from openpi.shared import image_tools
+    Input:  [*b, h, w, c] or [*b, c, h, w]
+    Output: same layout as input, resized/padded to (height, width).
+    """
+    if images.shape[-1] <= 4:  # channels-last
+        channels_last = True
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        images = images.permute(0, 3, 1, 2)
+    else:
+        channels_last = False
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+    batch_size = images.shape[0]
+    cur_height, cur_width = images.shape[-2], images.shape[-1]
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+
+    resized_images = F.interpolate(
+        images,
+        size=(resized_height, resized_width),
+        mode=mode,
+        align_corners=False if mode == "bilinear" else None,
+    )
+
+    if images.dtype == torch.uint8:
+        resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
+        constant_value = 0
+    elif images.dtype == torch.float32:
+        resized_images = resized_images.clamp(-1.0, 1.0)
+        constant_value = -1.0
+    else:
+        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+
+    pad_h0, remainder_h = divmod(height - resized_height, 2)
+    pad_h1 = pad_h0 + remainder_h
+    pad_w0, remainder_w = divmod(width - resized_width, 2)
+    pad_w1 = pad_w0 + remainder_w
+
+    padded_images = F.pad(
+        resized_images,
+        (pad_w0, pad_w1, pad_h0, pad_h1),
+        mode="constant",
+        value=constant_value,
+    )
+
+    if channels_last:
+        padded_images = padded_images.permute(0, 2, 3, 1)
+        if batch_size == 1 and padded_images.shape[0] == 1:
+            padded_images = padded_images.squeeze(0)
+    return padded_images
 
 logger = logging.getLogger("openpi")
 
@@ -47,7 +107,7 @@ def preprocess_observation_pytorch(
 
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
-            image = image_tools.resize_with_pad_torch(image, *image_resolution)
+            image = resize_with_pad_torch(image, *image_resolution)
 
         if train:
             # Convert from [-1, 1] to [0, 1] for PyTorch augmentations
