@@ -16,7 +16,44 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 - [Sept 2025] We released PyTorch support in openpi.
 - [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
 - [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID.
+
+## Benchmark Results: NVIDIA H200 vs AMD MI350
+
+Pi0 policy inference (3.5B model, BF16, torch.compile + CUDAGraph, 10 denoising steps).
+
+| GPU | Latency (ms) | Throughput (Hz) | vs H200 |
+|-----|--------------|-----------------|---------|
+| **AMD MI350** | **23.7** | **42.2** | $\color{green}{\textbf{1.07x}}$ |
+| NVIDIA H200 | 25.35 | 39.45 | baseline |
+
+### Batch size scaling (throughput)
+
+| BSZ | MI350 Samples/s | H200 Samples/s | MI350 vs H200 |
+|-----|----------------:|---------------:|---------------:|
+| 1 | 42.2 | 39.5 | $\color{green}{\textbf{1.07x}}$ |
+| 2 | 64.4 | 58.1 | $\color{green}{\textbf{1.11x}}$ |
+| 4 | 96.6 | 74.9 | $\color{green}{\textbf{1.29x}}$ |
+| 8 | 132.4 | 85.0 | $\color{green}{\textbf{1.56x}}$ |
+| 16 | 156.6 | 91.4 | $\color{green}{\textbf{1.71x}}$ |
+| 32 | 168.6 | 94.0 | $\color{green}{\textbf{1.79x}}$ |
+| **64** | **182.4** | **97.6** | $\color{green}{\textbf{1.87x}}$ |
+
+### Batch size scaling (latency)
+
+| BSZ | MI350 (ms) | H200 (ms) |
+|-----|----------:|---------:|
+| 1 | 23.7 | 25.3 |
+| 2 | 31.1 | 34.4 |
+| 4 | 41.4 | 53.4 |
+| 8 | 59.9 | 94.1 |
+| 16 | 100.9 | 175.1 |
+| 32 | 189.8 | 340.5 |
+| 64 | 349.8 | 655.9 |
+
+MI350 peak: **182.4 samples/s** at BSZ 64 ($\color{green}{\textbf{1.87x}}$ H200)
+
+See `mi350-benchmark-comparison` branch for optimization details and repro instructions.
 
 
 ## Requirements

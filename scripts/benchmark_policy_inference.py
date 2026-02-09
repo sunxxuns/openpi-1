@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Benchmark full Pi0 policy inference on AMD MI350.
+
+Tests the complete inference pipeline:
+- Image encoding (SigLIP vision tower)
+- Language encoding (Gemma embedding)
+- Prefill (KV cache generation for images + text)
+- Denoising steps (10 steps of action generation)
+
+This measures realistic end-to-end latency for robot control at batch_size=1.
+"""
+
+import os
+import sys
+import pathlib
+import shutil
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+import time
+import numpy as np
+import torch
+from torch.profiler import profile, ProfilerActivity
+
+# Enable optimizations by default (can be overridden via env)
+os.environ.setdefault("USE_AITER_ATTENTION", "1")
+os.environ.setdefault("USE_FUSED_PROJECTIONS", "1")
+os.environ.setdefault("USE_AITER_GEMM", "1")
+os.environ.setdefault("USE_OPTIMIZED_OPS", "1")
+os.environ.setdefault("AITER_MASK_OVERRIDE", "1")
+os.environ.setdefault("OPENPI_INDUCTOR_LOG", "0")
+os.environ.setdefault("AUTO_PATCH_TRANSFORMERS", "1")
+
+
+def _maybe_patch_transformers():
+    """Copy local transformers replacements into site-packages if enabled."""
+    if os.environ.get("AUTO_PATCH_TRANSFORMERS", "0") != "1":
+        return
+    try:
+        import transformers
+
+        src = pathlib.Path(__file__).resolve().parents[1] / "src" / "openpi" / "models_pytorch" / "transformers_replace" / "models"
+        dest = pathlib.Path(transformers.__file__).resolve().parents[1] / "models"
+        for child in src.iterdir():
+            if child.is_dir():
+                shutil.copytree(child, dest / child.name, dirs_exist_ok=True)
+        print("Patched transformers models from repo")
+    except Exception as exc:
+        print(f"Warning: could not patch transformers models: {exc}")
+
+
+_maybe_patch_transformers()
+
+# Try to enable aiter attention (AMD-specific), skip on NVIDIA
+USE_AITER = False
+try:
+    from transformers.models.gemma.modeling_gemma import set_use_aiter_attention
+    set_use_aiter_attention(True)
+    USE_AITER = True
+except ImportError:
+    print("Note: aiter not available (AMD-specific), using standard attention")
+
+
+def main():
+    print("=" * 70)
+    print("PI0 FULL POLICY INFERENCE BENCHMARK")
+    print("=" * 70)
+    
+    device = torch.device("cuda:0")
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"Aiter Flash Attention: {'Enabled' if USE_AITER else 'Not available (NVIDIA GPU)'}")
+    
+    # Create model with torch.compile (reduce-overhead mode for CUDA graphs)
+    print("\nCreating Pi0 model...")
+    
+    from dataclasses import dataclass
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+    
+    # Create a minimal config class for PyTorch (avoiding JAX/flax imports)
+    @dataclass
+    class Pi0ConfigPytorch:
+        action_dim: int = 32
+        action_horizon: int = 10
+        max_token_len: int = 48
+        dtype: str = 'bfloat16'
+        paligemma_variant: str = 'gemma_2b'
+        action_expert_variant: str = 'gemma_300m'
+        pi05: bool = False
+    
+    config = Pi0ConfigPytorch()
+    
+    model = PI0Pytorch(config)
+    model = model.to(device)
+    model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+
+    # Enable aiter GEMM for optimized matrix multiply (if available)
+    if os.environ.get("USE_AITER_GEMM", "0") == "1":
+        try:
+            from openpi.models_pytorch.aiter_ops import (
+                set_use_aiter_gemm,
+                patch_linear_forward,
+                AITER_GEMM_AVAILABLE,
+            )
+            if AITER_GEMM_AVAILABLE:
+                set_use_aiter_gemm(True)
+                patch_linear_forward()
+                print("Enabled aiter GEMM for optimized matrix multiply")
+            else:
+                print("Warning: aiter GEMM not available")
+        except Exception as e:
+            print(f"Warning: Could not enable aiter GEMM: {e}")
+
+    # Fuse linear projections to reduce kernel launch overhead
+    try:
+        model.paligemma_with_expert.fuse_projections(verbose=True)
+    except Exception as e:
+        if os.environ.get("USE_FUSED_PROJECTIONS", "0") == "1":
+            print(f"Warning: Could not fuse projections: {e}")
+
+    # Skip expensive mask checks in aiter attention (benchmark-only)
+    if os.environ.get("AITER_MASK_OVERRIDE", "0") == "1":
+        try:
+            for layer in model.paligemma_with_expert.paligemma.language_model.layers:
+                layer.self_attn._aiter_mask_type = "full"  # full bidirectional
+            for layer in model.paligemma_with_expert.gemma_expert.model.layers:
+                layer.self_attn._aiter_mask_type = "eager"  # complex mask, skip flash path
+            print("Applied aiter mask overrides (full/eager)")
+        except Exception as e:
+            print(f"Warning: Could not apply aiter mask overrides: {e}")
+    model.eval()
+    
+    # torch.compile is applied in PI0Pytorch.__init__ with mode from TORCH_COMPILE_MODE env var
+    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
+    print(f"torch.compile mode: {compile_mode}")
+    
+    param_count = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"Model parameters: {param_count:.2f}B")
+    
+    # Create observation
+    print("\nCreating observation (batch_size=1)...")
+    batch_size = 1
+    
+    # Simple observation class for PyTorch benchmark
+    class SimpleObservation:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+    
+    images = {
+        'base_0_rgb': torch.rand(batch_size, 3, 224, 224, dtype=torch.float32, device=device) * 2 - 1,
+        'left_wrist_0_rgb': torch.rand(batch_size, 3, 224, 224, dtype=torch.float32, device=device) * 2 - 1,
+        'right_wrist_0_rgb': torch.zeros(batch_size, 3, 224, 224, dtype=torch.float32, device=device),
+    }
+    image_masks = {
+        'base_0_rgb': torch.ones(batch_size, dtype=torch.bool, device=device),
+        'left_wrist_0_rgb': torch.ones(batch_size, dtype=torch.bool, device=device),
+        'right_wrist_0_rgb': torch.zeros(batch_size, dtype=torch.bool, device=device),
+    }
+    state = torch.randn(batch_size, 32, dtype=torch.bfloat16, device=device)
+    tokenized_prompt = torch.randint(0, 256000, (batch_size, 20), dtype=torch.long, device=device)
+    tokenized_prompt_mask = torch.ones(batch_size, 20, dtype=torch.bool, device=device)
+    token_ar_mask = torch.ones(batch_size, 20, dtype=torch.int32, device=device)
+    token_loss_mask = torch.zeros(batch_size, 20, dtype=torch.bool, device=device)
+    
+    observation = SimpleObservation(
+        images=images,
+        image_masks=image_masks,
+        state=state,
+        tokenized_prompt=tokenized_prompt,
+        tokenized_prompt_mask=tokenized_prompt_mask,
+        token_ar_mask=token_ar_mask,
+        token_loss_mask=token_loss_mask,
+    )
+    
+    # Benchmark (allow env overrides for faster iterations)
+    num_steps = int(os.environ.get("NUM_STEPS", "10"))
+    warmup = int(os.environ.get("WARMUP", "10"))
+    iterations = int(os.environ.get("ITERATIONS", "30"))
+    
+    print(f"\nDenoising steps: {num_steps}")
+    print(f"Warmup: {warmup}, Iterations: {iterations}")
+    print("-" * 50)
+    
+    # Warmup
+    print("Warmup...")
+    for _ in range(warmup):
+        with torch.no_grad():
+            _ = model.sample_actions(device, observation, num_steps=num_steps)
+    torch.cuda.synchronize()
+    
+    # Optional profiling (set PROFILE=1)
+    if os.environ.get("PROFILE", "0") == "1":
+        trace_dir = os.environ.get("PROFILE_DIR", "traces")
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_path = os.path.join(trace_dir, f"policy_inference_compiled_{compile_mode}.json")
+        print("\nProfiling (1 iteration)...")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+        ) as prof:
+            with torch.no_grad():
+                _ = model.sample_actions(device, observation, num_steps=num_steps)
+            torch.cuda.synchronize()
+        prof.export_chrome_trace(trace_path)
+        trace_size_mb = os.path.getsize(trace_path) / 1024 / 1024
+        print(f"Trace saved: {trace_path} ({trace_size_mb:.1f} MB)")
+        print("\nTop ops by self CUDA time:")
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+
+    # Benchmark
+    print("Benchmarking...")
+    latencies = []
+    for i in range(iterations):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.no_grad():
+            actions = model.sample_actions(device, observation, num_steps=num_steps)
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+        latencies.append((end - start) * 1000)
+        print(f"  Iteration {i+1}: {latencies[-1]:.1f} ms")
+    
+    # Results
+    print(f"\n{'='*70}")
+    print("RESULTS")
+    print("=" * 70)
+    print(f"Mean latency:   {np.mean(latencies):.1f} ms")
+    print(f"Std:            {np.std(latencies):.1f} ms")
+    print(f"Min:            {np.min(latencies):.1f} ms")
+    print(f"Max:            {np.max(latencies):.1f} ms")
+    print(f"P50:            {np.percentile(latencies, 50):.1f} ms")
+    print(f"P95:            {np.percentile(latencies, 95):.1f} ms")
+    print(f"Actions shape:  {tuple(actions.shape)}")
+    print(f"Throughput:     {1000/np.mean(latencies):.2f} Hz")
+    
+    # Memory
+    print(f"\n{'='*70}")
+    print("MEMORY")
+    print("=" * 70)
+    print(f"Allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
+    print(f"Reserved:  {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
+    
+    print("\n" + "=" * 70)
+
+
+if __name__ == "__main__":
+    main()
