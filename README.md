@@ -29,9 +29,10 @@ Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 
 Per denoise step: **~1.1 ms**.
 
-Trace files (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/)):
-- `traces/mi300x_pi0_bsz1_no_cudagraph_27ms.json` — full kernel detail (18 MB, 2927 kernels, 27.1 ms GPU time). Use this for breakdown analysis.
-- `traces/mi300x_pi0_bsz1_cudagraph_replay_26ms.json` — graph replay (53 KB, opaque `hipGraphLaunch`). ROCm 7.0 profiler cannot see inside graph replay; included for comparison only.
+Trace file (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/)):
+- `traces/mi300x_pi0_bsz1_no_cudagraph_27ms.json` — full kernel detail (18 MB, 2927 kernels, 27.1 ms GPU time)
+
+ROCm 7.0 limitation: neither PyTorch profiler nor rocprofv3 can see individual kernels inside `hipGraphLaunch`. The non-graph trace captures the **identical kernels** that execute during graph replay — only CPU dispatch overhead differs (eliminated by CUDAGraph, reducing wall-clock from ~141 ms to 26.1 ms).
 
 ### Breakdown details
 
