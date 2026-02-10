@@ -31,6 +31,8 @@ Per denoise step: **~1.1 ms**.
 
 Trace file: `traces/mi300x_pi0_policy_inference_26ms_38hz.json` (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/))
 
+Note: trace was captured without CUDAGraph (profiler cannot see inside `hipGraphLaunch` on ROCm 7.0). The 141ms trace span is CPU dispatch overhead; the **27.1 ms GPU kernel time** is what actually executes inside the 26.1ms CUDAGraph replay. Kernels are identical in both paths.
+
 ### Breakdown details
 
 **ViT (SigLIP)** — 3 cameras × 9 layers, 27 flash-attention calls:
