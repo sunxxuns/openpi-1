@@ -15,17 +15,17 @@ Both models: 3 camera images (224×224), 10 diffusion denoising steps.
 
 ### Pi0
 
-| GPU | Arch | E2E latency (ms) | Throughput (Hz) |
-|-----|------|------------------:|----------------:|
-| **AMD MI300X** | gfx942 | **26.1** | **38.3** |
-| AMD MI350 | gfx950 | 25.3 | 39.5 |
-| NVIDIA H200 | sm_90 | 25.35 | 39.5 |
+| GPU | Arch | Power cap (W) | E2E latency (ms) | Throughput (Hz) |
+|-----|------|-------------:|------------------:|----------------:|
+| **AMD MI300X** | gfx942 | 750 | **26.1** | **38.3** |
+| AMD MI350 | gfx950 | 750 | 25.3 | 39.5 |
+| NVIDIA H200 | sm_90 | 700 | 25.35 | 39.5 |
 
 ### Pi0.5
 
-| GPU | Arch | E2E latency (ms) | Throughput (Hz) |
-|-----|------|------------------:|----------------:|
-| **AMD MI300X** | gfx942 | **28.7** | **34.9** |
+| GPU | Arch | Power cap (W) | E2E latency (ms) | Throughput (Hz) |
+|-----|------|-------------:|------------------:|----------------:|
+| **AMD MI300X** | gfx942 | 750 | **28.7** | **34.9** |
 
 Pi0.5 is ~10% slower than Pi0 due to AdaRMS conditioning in the action expert.
 
@@ -184,7 +184,7 @@ python scripts/extract_rocprof_trace.py traces/rocprof/mi300x_pi0_graph_results.
 
 ## Environment
 
-- AMD MI300X (gfx942), 304 CUs, 206 GB HBM3
+- AMD MI300X (gfx942), 304 CUs, 206 GB HBM3, 750W power cap (verified via `rocm-smi --showmaxpower`)
 - PyTorch 2.9.0a0+git7bcbafe, ROCm/HIP 7.0
 - aiter flash attention + aiter GEMM (hipblaslt)
 - torch.compile mode=default, manual CUDAGraph capture
