@@ -30,10 +30,10 @@ Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 Per denoise step: **~1.1 ms**.
 
 Trace files (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/)):
-- `traces/mi300x_pi0_bsz1_no_cudagraph_27ms.json` — **full kernel detail** (18 MB, 2927 kernels, 27.1 ms GPU time). Use this for breakdown.
-- `traces/mi300x_pi0_bsz1_cudagraph_replay_partial_1ms.json` — graph replay, partial capture (66 KB, 79/~1500 kernels). ROCm 7.0 limitation.
+- `traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json` — **CUDAGraph replay** (517 KB, 2929 kernels, 29.9 ms GPU, 97.8% util). Captured via `rocprofv3 --kernel-trace`.
+- `traces/mi300x_pi0_bsz1_no_cudagraph_27ms.json` — no CUDAGraph (18 MB, 2927 kernels, 27.1 ms GPU). PyTorch profiler with op attribution.
 
-ROCm 7.0 limitation: `hipGraphLaunch` kernel tracing is incomplete (only ~5% of kernels visible via `enable_cuda_sync_events`; rocprofv3 captures 0%). The MI350 trace (ROCm 6.x) does not have this issue. The non-graph trace captures the **identical kernels** — only CPU dispatch overhead differs (CUDAGraph eliminates it: ~141 ms wall → 26.1 ms).
+The CUDAGraph trace was captured using `rocprofv3 --kernel-trace` which instruments at the HIP level and sees every GPU kernel inside graph replay (unlike PyTorch's profiler which only sees the opaque `hipGraphLaunch` call). The ~3 ms difference (29.9 vs 27.1 ms kernel sum) is rocprofv3 instrumentation overhead (~5 us/kernel × 2929 kernels).
 
 ### Breakdown details
 
@@ -73,17 +73,21 @@ OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
 TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference.py --batch-size 1
 
-# Generate trace + breakdown
-PROFILE=1 PROFILE_DIR=traces \
+# CUDAGraph trace via rocprofv3 (sees kernels inside graph replay)
 AITER_PRESHUFFLE_WEIGHTS=0 OPENPI_SKIP_MASKED_IMAGES=0 \
-OPENPI_MANUAL_CUDAGRAPH=1 OPENPI_EAGER_ATTN_USE_SDPA=1 \
-OPENPI_FUSE_SIGLIP_QKV=1 OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
+OPENPI_EAGER_ATTN_USE_SDPA=1 OPENPI_FUSE_SIGLIP_QKV=1 \
+OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
 OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1 OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
 TORCH_COMPILE_MODE=default \
-python scripts/benchmark_policy_inference.py --batch-size 1
+rocprofv3 --kernel-trace -d traces/rocprof -o mi300x_pi0_graph -- \
+python scripts/trace_cudagraph.py
+
+# Extract last graph replay from rocprofv3 DB to Chrome trace JSON
+python scripts/extract_rocprof_trace.py traces/rocprof/mi300x_pi0_graph_results.db \
+  -o traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json
 
 # Analyze trace
-python scripts/analyze_policy_trace.py traces/mi300x_pi0_policy_inference_26ms_38hz.json
+python scripts/analyze_policy_trace.py traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json
 ```
 
 ## Environment
