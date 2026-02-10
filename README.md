@@ -1,21 +1,36 @@
 # OpenPI Policy Inference Benchmark — AMD MI300X (BSZ=1)
 
-## Model
 
-**Pi0** (`pi05=False`), 3.5B parameters.  
-- Vision: SigLIP ViT (3 camera images, 224×224)  
-- Language: Gemma 2B (prefix / KV-cache build)  
-- Action expert: Gemma 300M (10 diffusion denoising steps)
+## Models
+
+| Model | Params | Architecture |
+|-------|-------:|--------------|
+| **Pi0** | 3.5B | SigLIP ViT + Gemma 2B + Gemma 300M action expert |
+| **Pi0.5** | 3.5B | SigLIP ViT + Gemma 2B + Gemma 300M action expert (AdaRMS) |
+
+Both models: 3 camera images (224×224), 10 diffusion denoising steps.
+
 
 ## End-to-end latency (BSZ=1, CUDAGraph, fastest)
+
+### Pi0
 
 | GPU | Arch | E2E latency (ms) | Throughput (Hz) |
 |-----|------|------------------:|----------------:|
 | **AMD MI300X** | gfx942 | **26.1** | **38.3** |
 | AMD MI350 | gfx950 | 25.3 | 39.5 |
-| NVIDIA H200 | sm_90 | 25.3 | 39.5 |
+| NVIDIA H200 | sm_90 | 25.35 | 39.5 |
 
-## Latency breakdown (BSZ=1, from profiler trace with CUDAGraph)
+### Pi0.5
+
+| GPU | Arch | E2E latency (ms) | Throughput (Hz) |
+|-----|------|------------------:|----------------:|
+| **AMD MI300X** | gfx942 | **28.7** | **34.9** |
+
+Pi0.5 is ~10% slower than Pi0 due to AdaRMS conditioning in the action expert.
+
+
+## Pi0 latency breakdown (BSZ=1, MI300X, from profiler trace)
 
 Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 
@@ -28,12 +43,6 @@ Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 | **Total** | **27.1** | **100%** | |
 
 Per denoise step: **~1.1 ms**.
-
-Trace files (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/)):
-- `traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json` — **CUDAGraph replay** (517 KB, 2929 kernels, 29.9 ms GPU, 97.8% util). Captured via `rocprofv3 --kernel-trace`.
-- `traces/mi300x_pi0_bsz1_no_cudagraph_27ms.json` — no CUDAGraph (18 MB, 2927 kernels, 27.1 ms GPU). PyTorch profiler with op attribution.
-
-The CUDAGraph trace was captured using `rocprofv3 --kernel-trace` which instruments at the HIP level and sees every GPU kernel inside graph replay (unlike PyTorch's profiler which only sees the opaque `hipGraphLaunch` call). The ~3 ms difference (29.9 vs 27.1 ms kernel sum) is rocprofv3 instrumentation overhead (~5 us/kernel × 2929 kernels).
 
 ### Breakdown details
 
@@ -56,12 +65,62 @@ The CUDAGraph trace was captured using `rocprofv3 --kernel-trace` which instrume
 - RMSNorm (expert + decode): 0.765 ms / 312 calls
 - `aten::fill_` + other: 0.587 ms
 
+
+## MI350 results (from `wip/mi350-23ms-fusion-tuning` branch)
+
+### Pi0 BSZ=1
+
+| GPU | Arch | E2E latency (ms) | Throughput (Hz) |
+|-----|------|------------------:|----------------:|
+| AMD MI350 | gfx950 | 25.3 | 39.5 |
+| NVIDIA H200 | sm_90 | 25.35 | 39.5 |
+
+MI350 trace: 1522 kernels, 15.0 ms kernel sum, 100% GPU utilization.
+
+### MI350 batch size scaling (Pi0)
+
+| BSZ | MI350 Latency (ms) | MI350 Samples/s | H200 Latency (ms) | H200 Samples/s | MI350 speedup |
+|-----|--------------------:|----------------:|-------------------:|---------------:|--------------:|
+| 1 | 25.3 | 39.5 | 25.3 | 39.5 | 1.00x |
+| 2 | 36.9 | 54.2 | 34.4 | 58.1 | 0.93x |
+| 4 | 49.4 | 81.0 | 53.4 | 74.9 | 1.08x |
+| 8 | 71.5 | 111.9 | 94.1 | 85.0 | 1.32x |
+| 16 | 121.9 | 131.2 | 175.1 | 91.4 | 1.44x |
+| 32 | 217.8 | 146.9 | 340.5 | 94.0 | 1.56x |
+| **64** | **416.3** | **153.7** | **655.9** | **97.6** | **1.58x** |
+
+### MI350 optimization ladder (Pi0)
+
+| Step | Enabled | Mean (ms) | Hz | Δ vs prev |
+|------|---------|-----------|----|-----------|
+| 0 | baseline | 63.1 | 15.9 | - |
+| 1 | + CUDAGraph replay | 30.1 | 33.3 | -33.0 |
+| 2 | + SDPA KV-cache fast-path | 27.3 | 36.7 | -2.8 |
+| 3 | + route fused projections to aiter GEMM | 26.3 | 38.0 | -1.0 |
+| 4 | + fuse SigLIP QKV (3 GEMMs → 1) | 25.8 | 38.8 | -0.5 |
+| 5 | + native GELU + aggressive fusion | 25.3 | 39.5 | -0.5 |
+
+
+## Traces
+
+Viewable at [ui.perfetto.dev](https://ui.perfetto.dev/).
+
+| File | HW | Method | Kernels | GPU time | Size |
+|------|----|--------|--------:|--------:|-----:|
+| `mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json` | MI300X | rocprofv3 --kernel-trace (CUDAGraph) | 2929 | 29.9 ms | 517 KB |
+| `mi300x_pi0_bsz1_no_cudagraph_27ms.json` | MI300X | PyTorch profiler (no graph) | 2927 | 27.1 ms | 18 MB |
+| `mi350_policy_inference_21ms_47hz.json` | MI350 | PyTorch profiler (CUDAGraph) | 1522 | 15.0 ms | 844 KB |
+| `h200_policy_inference_25ms_39hz.json` | H200 | PyTorch profiler | — | — | 3.4 MB |
+
+The MI300X CUDAGraph trace was captured using `rocprofv3 --kernel-trace` which instruments at the HIP level and sees every GPU kernel inside graph replay. The ~3 ms delta (29.9 vs 27.1 ms) is rocprofv3 per-kernel instrumentation overhead.
+
+
 ## How to reproduce
 
 ```bash
 cd /sgl-workspace/openpi-1
 
-# E2E latency (CUDAGraph, fastest)
+# Pi0 BSZ=1 (CUDAGraph, fastest)
 AITER_PRESHUFFLE_WEIGHTS=0 \
 OPENPI_SKIP_MASKED_IMAGES=0 \
 OPENPI_MANUAL_CUDAGRAPH=1 \
@@ -73,7 +132,20 @@ OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
 TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference.py --batch-size 1
 
-# CUDAGraph trace via rocprofv3 (sees kernels inside graph replay)
+# Pi0.5 BSZ=1 (CUDAGraph, fastest)
+OPENPI_PI05=1 \
+AITER_PRESHUFFLE_WEIGHTS=0 \
+OPENPI_SKIP_MASKED_IMAGES=0 \
+OPENPI_MANUAL_CUDAGRAPH=1 \
+OPENPI_EAGER_ATTN_USE_SDPA=1 \
+OPENPI_FUSE_SIGLIP_QKV=1 \
+OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
+OPENPI_ROUTE_FUSED_LINEAR_TO_AITER=1 \
+OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
+TORCH_COMPILE_MODE=default \
+python scripts/benchmark_policy_inference.py --batch-size 1
+
+# CUDAGraph trace via rocprofv3
 AITER_PRESHUFFLE_WEIGHTS=0 OPENPI_SKIP_MASKED_IMAGES=0 \
 OPENPI_EAGER_ATTN_USE_SDPA=1 OPENPI_FUSE_SIGLIP_QKV=1 \
 OPENPI_ROUTE_SIGLIP_FUSED_QKV_TO_AITER=1 \
@@ -82,12 +154,9 @@ TORCH_COMPILE_MODE=default \
 rocprofv3 --kernel-trace -d traces/rocprof -o mi300x_pi0_graph -- \
 python scripts/trace_cudagraph.py
 
-# Extract last graph replay from rocprofv3 DB to Chrome trace JSON
+# Extract last graph replay to Chrome trace
 python scripts/extract_rocprof_trace.py traces/rocprof/mi300x_pi0_graph_results.db \
   -o traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json
-
-# Analyze trace
-python scripts/analyze_policy_trace.py traces/mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json
 ```
 
 ## Environment

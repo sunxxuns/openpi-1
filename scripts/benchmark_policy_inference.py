@@ -234,6 +234,12 @@ def main():
         pi05: bool = False
     
     config = Pi0ConfigPytorch()
+    # Toggle pi0.5 model via env var
+    if os.environ.get("OPENPI_PI05", "0") == "1":
+        config.pi05 = True
+        print("[openpi] Using Pi0.5 model (pi05=True)", flush=True)
+    else:
+        print("[openpi] Using Pi0 model (pi05=False)", flush=True)
     # Allow e2e benchmarking of different predicted token counts (action horizon).
     # Example: OPENPI_ACTION_HORIZON=15 for "1 + 15 action tokens" style tests.
     config.action_horizon = int(os.environ.get("OPENPI_ACTION_HORIZON", str(config.action_horizon)))

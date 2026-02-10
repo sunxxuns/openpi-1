@@ -143,6 +143,11 @@ def main():
         pi05: bool = False
 
     config = Pi0ConfigPytorch()
+    if os.environ.get("OPENPI_PI05", "0") == "1":
+        config.pi05 = True
+        print("Model: Pi0.5 (pi05=True)")
+    else:
+        print("Model: Pi0 (pi05=False)")
     model = PI0Pytorch(config).to(device)
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
 
