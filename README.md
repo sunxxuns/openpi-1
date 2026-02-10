@@ -30,7 +30,9 @@ Both models: 3 camera images (224×224), 10 diffusion denoising steps.
 Pi0.5 is ~10% slower than Pi0 due to AdaRMS conditioning in the action expert.
 
 
-## Pi0 latency breakdown (BSZ=1, MI300X, from profiler trace)
+## Latency breakdown (BSZ=1, MI300X, from profiler trace)
+
+### Pi0
 
 Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 
@@ -44,7 +46,26 @@ Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 
 Per denoise step: **~1.1 ms**.
 
-### Breakdown details
+### Pi0.5
+
+Total GPU kernel time: **30.9 ms**. CUDAGraph replay: **28.7 ms**.
+
+| Stage | GPU time (ms) | % of total | Key ops |
+|-------|-------------:|-----------:|---------|
+| **ViT** (SigLIP) | **4.1** | **13%** | Same as Pi0 |
+| **LLM prefill** (Gemma 2B) | **10.7** | **34%** | Same as Pi0 |
+| **Diffusion + AdaRMS** (10 denoise steps) | **13.6** | **44%** | GEMM 5.8 + SDPA 1.6 + RoPE 2.9 + **AdaRMS 1.0** + other 2.3 |
+| Other | 2.6 | 8% | fill, misc |
+| **Total** | **30.9** | **100%** | |
+
+Per denoise step: **~1.4 ms** (vs Pi0's ~1.1 ms). The +0.3 ms/step is from AdaRMS conditioning.
+
+**Pi0 vs Pi0.5 delta** (27.1 → 30.9 ms = **+3.8 ms**):
+- AdaRMS conditioning: **+1.0 ms** (new `triton_per_fused_addmm_silu`, 27 calls)
+- Increased fill/misc overhead: **+2.8 ms** (more buffers for AdaRMS state)
+
+
+### Pi0 breakdown details
 
 **ViT (SigLIP)** — 3 cameras × 9 layers, 27 flash-attention calls:
 - `aten::addmm` (biased linear, SigLIP-only): 2.978 ms / 130 calls
@@ -105,12 +126,14 @@ MI350 trace: 1522 kernels, 15.0 ms kernel sum, 100% GPU utilization.
 
 Viewable at [ui.perfetto.dev](https://ui.perfetto.dev/).
 
-| File | HW | Method | Kernels | GPU time | Size |
-|------|----|--------|--------:|--------:|-----:|
-| `mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json` | MI300X | rocprofv3 --kernel-trace (CUDAGraph) | 2929 | 29.9 ms | 517 KB |
-| `mi300x_pi0_bsz1_no_cudagraph_27ms.json` | MI300X | PyTorch profiler (no graph) | 2927 | 27.1 ms | 18 MB |
-| `mi350_policy_inference_21ms_47hz.json` | MI350 | PyTorch profiler (CUDAGraph) | 1522 | 15.0 ms | 844 KB |
-| `h200_policy_inference_25ms_39hz.json` | H200 | PyTorch profiler | — | — | 3.4 MB |
+| File | Model | HW | Method | Kernels | GPU time | Size |
+|------|-------|----|--------|--------:|--------:|-----:|
+| `mi300x_pi0_bsz1_cudagraph_rocprof_26ms.json` | Pi0 | MI300X | rocprofv3 (CUDAGraph) | 2929 | 29.9 ms | 517 KB |
+| `mi300x_pi0_bsz1_no_cudagraph_27ms.json` | Pi0 | MI300X | PyTorch profiler | 2927 | 27.1 ms | 18 MB |
+| `mi300x_pi05_bsz1_cudagraph_rocprof_28ms.json` | Pi0.5 | MI300X | rocprofv3 (CUDAGraph) | 3061 | 32.1 ms | 535 KB |
+| `mi300x_pi05_bsz1_no_cudagraph_31ms.json` | Pi0.5 | MI300X | PyTorch profiler | 3061 | 30.9 ms | 19 MB |
+| `mi350_policy_inference_21ms_47hz.json` | Pi0 | MI350 | PyTorch profiler (CUDAGraph) | 1522 | 15.0 ms | 844 KB |
+| `h200_policy_inference_25ms_39hz.json` | Pi0 | H200 | PyTorch profiler | — | — | 3.4 MB |
 
 The MI300X CUDAGraph trace was captured using `rocprofv3 --kernel-trace` which instruments at the HIP level and sees every GPU kernel inside graph replay. The ~3 ms delta (29.9 vs 27.1 ms) is rocprofv3 per-kernel instrumentation overhead.
 
