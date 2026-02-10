@@ -1,43 +1,41 @@
-# OpenPI Policy Inference Benchmark — AMD MI300X
+# OpenPI Policy Inference Benchmark — AMD MI300X (BSZ=1)
 
 ## Model
 
 **Pi0** (`pi05=False`), 3.5B parameters.  
-Architecture: PaliGemma (SigLIP ViT + Gemma 2B) + Gemma 300M action expert.
+- Vision: SigLIP ViT (3 camera images, 224×224)  
+- Language: Gemma 2B (prefix / KV-cache build)  
+- Action expert: Gemma 300M (10 diffusion denoising steps)
 
-## BSZ=1 headline (10 denoising steps)
+## End-to-end latency (BSZ=1, CUDAGraph, fastest)
 
-| GPU | Arch | Latency (ms) | Hz | Power (W) | Perf/W (Hz/kW) |
-|-----|------|-------------:|---:|----------:|-----------:|
-| **AMD MI300X** | gfx942 | **26.4** | **37.9** | ~750 | **50.5** |
-| AMD MI350 | gfx950 | 25.3 | 39.5 | ~1000 | 39.5 |
-| NVIDIA H200 | sm_90 | 25.3 | 39.5 | ~700 | 56.4 |
+| GPU | Arch | E2E latency (ms) | Throughput (Hz) |
+|-----|------|------------------:|----------------:|
+| **AMD MI300X** | gfx942 | **26.4** | **37.9** |
+| AMD MI350 | gfx950 | 25.3 | 39.5 |
+| NVIDIA H200 | sm_90 | 25.3 | 39.5 |
 
-MI300X is ~4% slower than MI350/H200 in raw latency but ~28% better perf/watt than MI350.
+## Latency breakdown (BSZ=1, CUDAGraph)
 
-## BSZ=1 latency breakdown (CUDAGraph, fastest)
+Total with CUDAGraph replay: **26.4 ms**.
 
-CUDAGraph replay total: **26.4 ms** (37.9 Hz).
+| Stage | Time (ms) | % of E2E | Notes |
+|-------|----------:|---------:|-------|
+| **ViT** (SigLIP) | **1.6** | 6% | 3 cameras → image tokens |
+| **LLM prefill** (Gemma 2B) | **2.9** | 11% | KV-cache build from image+text prefix |
+| **Diffusion** (Gemma 300M expert) | **21.9** | 83% | 10 denoise steps × ~2.2 ms/step |
+| **E2E total** | **26.4** | 100% | |
 
-Proportional breakdown estimated from per-stage CUDA-event timing (steady-state, iterations 14–30):
+Diffusion dominates at 83% of E2E. Per denoise step: **~2.2 ms**.
 
-| Stage | Without graph (ms) | % of total | Estimated with graph (ms) |
-|-------|-------------------:|-----------:|--------------------------:|
-| **ViT** (SigLIP vision, 3 cameras) | 8.1 | 5.9% | ~1.6 |
-| **LLM prefill** (Gemma 2B, KV-cache build) | 15.3 | 11.2% | ~2.9 |
-| **Diffusion** (10 denoise steps, Gemma 300M expert) | 113.5 | 82.9% | ~21.9 |
-| **Total** | **136.9** | **100%** | **26.4** |
-
-Per denoise step: ~2.2 ms (with graph) / ~11.4 ms (without graph).
-
-The 5× speedup from CUDAGraph comes from eliminating kernel launch overhead (~110 ms of CPU-side dispatch is replaced by a single graph replay).
+Methodology: per-stage GPU time measured with CUDA events under `torch.compile` (steady-state iterations 14–30), then proportionally mapped to the CUDAGraph E2E total. Individual stages cannot be timed inside a graph replay since the entire `sample_actions` call is captured as a single graph.
 
 ## How to reproduce
 
 ```bash
 cd /sgl-workspace/openpi-1
 
-# BSZ=1 with CUDAGraph (headline number)
+# E2E latency (CUDAGraph, fastest)
 AITER_PRESHUFFLE_WEIGHTS=0 \
 OPENPI_SKIP_MASKED_IMAGES=0 \
 OPENPI_MANUAL_CUDAGRAPH=1 \
@@ -49,7 +47,7 @@ OPENPI_ROUTE_FUSED_LINEAR_M_THRESH=1000000 \
 TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference.py --batch-size 1
 
-# Latency breakdown (ViT / LLM / Diffusion)
+# Per-stage breakdown (ViT / LLM / Diffusion)
 AITER_PRESHUFFLE_WEIGHTS=0 \
 OPENPI_SKIP_MASKED_IMAGES=0 \
 OPENPI_EAGER_ATTN_USE_SDPA=1 \
@@ -61,36 +59,10 @@ TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference_breakdown.py
 ```
 
-## MI300X vs MI350 key differences
-
-| | MI300X (gfx942) | MI350 (gfx950) |
-|---|---|---|
-| CUs | 304 | 304 |
-| Memory | 206 GB HBM3 | 192 GB HBM3 |
-| Bandwidth | ~5.3 TB/s | ~8 TB/s |
-| TDP | ~750W | ~1000W |
-| ASM GEMM kernels | No (hipblaslt only) | Yes (aiter gfx950 ASM) |
-| Weight pre-shuffle | No (`AITER_PRESHUFFLE_WEIGHTS=0`) | Available |
-
-## Batch size scaling (reference)
-
-All optimizations enabled, 10 denoising steps, no masked-image skip.
-
-| BSZ | MI300X (ms) | MI300X Samples/s | MI350 (ms) | MI350 Samples/s | H200 (ms) | H200 Samples/s |
-|-----|------------:|----------------:|-----------:|----------------:|----------:|---------------:|
-| 1 | 26.6 | 37.6 | 25.3 | 39.5 | 25.3 | 39.5 |
-| 2 | 36.3 | 55.1 | 36.9 | 54.2 | 34.4 | 58.1 |
-| 4 | 54.3 | 73.7 | 49.4 | 81.0 | 53.4 | 74.9 |
-| 8 | 91.2 | 87.7 | 71.5 | 111.9 | 94.1 | 85.0 |
-| 16 | 165.1 | 96.9 | 121.9 | 131.2 | 175.1 | 91.4 |
-| 32 | 307.9 | 104.0 | 217.8 | 146.9 | 340.5 | 94.0 |
-| **64** | **581.4** | **110.1** | **416.3** | **153.7** | **655.9** | **97.6** |
-
-MI300X peak: 110.1 samples/s at BSZ 64 (1.13× H200).
-
 ## Environment
 
+- AMD MI300X (gfx942), 304 CUs, 206 GB HBM3
 - PyTorch 2.9.0a0+git7bcbafe, ROCm/HIP 7.0
-- aiter flash attention + aiter GEMM (hipblaslt, no ASM)
+- aiter flash attention + aiter GEMM (hipblaslt)
 - torch.compile mode=default, manual CUDAGraph capture
 - `OPENPI_SKIP_MASKED_IMAGES=0` (apples-to-apples with H200)
