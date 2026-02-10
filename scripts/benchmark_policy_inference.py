@@ -504,11 +504,15 @@ def main():
             trace_dir, f"policy_inference_compiled_{compile_mode}_{trace_suffix}.json"
         )
         print("\nProfiling (1 iteration)...")
+        # enable_cuda_sync_events lets ROCm trace kernels inside HIP graph replay
+        from torch.profiler import _ExperimentalConfig
+        exp_cfg = _ExperimentalConfig(enable_cuda_sync_events=True) if profile_replay else None
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
             profile_memory=True,
             with_flops=True,
+            experimental_config=exp_cfg,
         ) as prof:
             with torch.no_grad():
                 if profile_replay and graph is not None:
