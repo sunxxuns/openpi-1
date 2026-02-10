@@ -29,7 +29,7 @@ Total GPU kernel time: **27.1 ms**. CUDAGraph replay: **26.1 ms**.
 
 Per denoise step: **~1.1 ms**.
 
-Trace file: `traces/policy_inference_compiled_default_call.json` (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/))
+Trace file: `traces/mi300x_pi0_policy_inference_26ms_38hz.json` (viewable at [ui.perfetto.dev](https://ui.perfetto.dev/))
 
 ### Breakdown details
 
@@ -79,7 +79,7 @@ TORCH_COMPILE_MODE=default \
 python scripts/benchmark_policy_inference.py --batch-size 1
 
 # Analyze trace
-python scripts/analyze_policy_trace.py traces/policy_inference_compiled_default_call.json
+python scripts/analyze_policy_trace.py traces/mi300x_pi0_policy_inference_26ms_38hz.json
 ```
 
 ## Environment
