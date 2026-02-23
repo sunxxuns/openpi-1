@@ -5,10 +5,19 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
+import torch._inductor.config as ic
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.model_fusion import fuse_qkv_projections, fuse_gate_up_projections
+
+# Inductor tuning flags for better inference performance
+ic.coordinate_descent_tuning = True  # Auto-tune Triton block sizes per kernel
+ic.benchmark_kernel = True  # Benchmark kernel implementations, pick fastest
+ic.group_fusion = True  # Fuse groups of similar ops
+ic.freezing = True  # Constant-fold weights (inference only)
+ic.max_fusion_size = 256  # Larger fused kernels = fewer graph launches
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -108,8 +117,13 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Apply GEMM fusions before torch.compile for better performance
+        # This fuses QKV projections and Gate+Up projections
+        fuse_qkv_projections(self)
+        fuse_gate_up_projections(self)
+
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        self.sample_actions = torch.compile(self.sample_actions, mode="reduce-overhead")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -402,9 +416,13 @@ class PI0Pytorch(nn.Module):
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        # Use a fixed for loop instead of while to avoid data-dependent branching graph break
+        # Pre-allocate time tensor and reuse it across iterations
+        dt_scalar = -1.0 / num_steps
+        expanded_time = torch.empty(bsize, dtype=torch.float32, device=device)
+        for i in range(num_steps):
+            time_val = 1.0 + i * dt_scalar
+            expanded_time.fill_(time_val)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -412,10 +430,7 @@ class PI0Pytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
-
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            time += dt
         return x_t
 
     def denoise_step(
